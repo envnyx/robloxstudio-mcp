@@ -33,7 +33,7 @@ import { RELEASE_ARTIFACTS_DIRECTORY, RELEASE_OUTPUT_ENV } from '../scripts/rele
 
 const VARIANTS = {
   main: {
-    packageName: '@chrrxs/robloxstudio-mcp',
+    packageName: '@as-tra/robloxstudio-mcp',
     workspace: 'packages/robloxstudio-mcp',
     asset: 'MCPPlugin.rbxmx',
     otherAsset: 'MCPInspectorPlugin.rbxmx',

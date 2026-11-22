@@ -88,7 +88,7 @@ fi
 export PATH
 
 if [[ "${ROBLOXSTUDIO_MCP_USE_PUBLISHED:-}" == "1" ]]; then
-	exec npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp --auto-install-plugin
+	exec npx -y @as-tra/robloxstudio-mcp@latest --auto-install-plugin
 fi
 
 cd "${DEV_ROOT}"

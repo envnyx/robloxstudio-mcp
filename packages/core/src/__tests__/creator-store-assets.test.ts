@@ -845,7 +845,7 @@ describe('distribution metadata security contract', () => {
 
     expect(combinedSources).not.toContain('Akramle');
     expect(combinedSources).not.toContain('github:Akramle');
-    expect(combinedSources).toContain('-p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp');
+    expect(combinedSources).toContain('@as-tra/robloxstudio-mcp@latest');
     expect(combinedSources).not.toContain('@chrrxs/robloxstudio-mcp@latest');
     expect(combinedSources).toContain('github.com/chrrxs/robloxstudio-mcp');
   });
