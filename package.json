@@ -9,7 +9,20 @@
   "workspaces": [
     "packages/*"
   ],
+  "bin": {
+    "robloxstudio-mcp": "packages/robloxstudio-mcp/dist/index.js",
+    "robloxstudio-mcp-inspector": "packages/robloxstudio-mcp-inspector/dist/index.js"
+  },
+  "files": [
+    "packages/robloxstudio-mcp/dist/",
+    "packages/robloxstudio-mcp/package.json",
+    "packages/robloxstudio-mcp-inspector/dist/",
+    "packages/robloxstudio-mcp-inspector/package.json",
+    "studio-plugin/MCPPlugin.rbxmx",
+    "studio-plugin/MCPInspectorPlugin.rbxmx"
+  ],
   "scripts": {
+    "prepare": "npm run build && npm ci --prefix studio-plugin && npm run compile:plugin && node scripts/build-plugin.mjs --build-only && node scripts/build-plugin.mjs --variant inspector --build-only",
     "build": "npm run build -w packages/core && npm run build -w packages/robloxstudio-mcp && npm run build -w packages/robloxstudio-mcp-inspector",
     "compile:plugin": "npm --prefix studio-plugin run build",
     "build:plugin": "npm run compile:plugin && node scripts/build-plugin.mjs",
@@ -72,6 +85,9 @@
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/node": "^2.0.0",
-    "@modelcontextprotocol/server": "^2.0.0"
+    "@modelcontextprotocol/server": "^2.0.0",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.14.2"
   }
 }
