@@ -28,6 +28,7 @@ if (installBundledOnly || installWithFallback) {
   if (openCloudKey) process.env.ROBLOX_OPEN_CLOUD_API_KEY = openCloudKey;
   if (creatorId) process.env.ROBLOX_CREATOR_USER_ID = creatorId;
   if (creatorGroupId) process.env.ROBLOX_CREATOR_GROUP_ID = creatorGroupId;
+  if (process.argv.includes('--code-mode')) process.env.ROBLOX_MCP_CODE_MODE = '1';
 
   const require = createRequire(import.meta.url);
   const { version: VERSION } = require('../package.json');

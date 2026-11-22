@@ -138,6 +138,26 @@ See [Native Linux with Wine](docs/configuration.md#native-linux-with-wine).
 
 </details>
 
+## Code mode (fewer tokens)
+
+Add `--code-mode` (or set `ROBLOX_MCP_CODE_MODE=1`, which also works for the
+inspector edition) to replace the full tool list with two tools, following
+Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode/) and its
+[search/execute server](https://blog.cloudflare.com/code-mode-mcp/):
+
+- `search`: keywords in, TypeScript signatures out (an empty query lists every tool).
+- `execute`: JavaScript that calls `studio.<tool_name>(input)`, chains calls and
+  returns only what the model needs. Inputs are checked against each tool's schema.
+
+```bash
+claude mcp add robloxstudio -- npx -y @chrrxs/robloxstudio-mcp@latest --auto-install-plugin --code-mode
+```
+
+With the 51 standard tools, the `tools/list` payload drops from 53,463 to 1,002
+characters. The code runs in a `node:vm` context with only `studio` and `console`
+in scope and a 5 minute limit. That is not a security sandbox, so code mode is
+off by default and meant for agents you already trust with `execute_luau`.
+
 ## Inspector edition
 
 Read-only access to the DataModel.

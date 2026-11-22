@@ -8,6 +8,7 @@ import {
   type ToolAnnotations,
 } from '@modelcontextprotocol/server';
 import { MultiplayerGroupInUseError, RequestFailure, RoutingFailure, StudioOperationError } from './bridge-service.js';
+import { CODE_MODE_INSTRUCTIONS, codeModeEnabled, runCode, searchTools } from './code-mode.js';
 import { registerResourceHandlers } from './mcp-compat.js';
 import { OpenCloudOperationError } from './opencloud-client.js';
 import { StudioLaunchPreDispatchError } from './studio-instance-manager.js';
@@ -38,6 +39,8 @@ export interface McpRuntimeOptions {
   ) => Promise<unknown>;
   allowedTools?: ReadonlySet<string>;
   era: ProtocolEra;
+  /** Expose search + execute instead of every tool; defaults to ROBLOX_MCP_CODE_MODE. */
+  codeMode?: boolean;
 }
 
 type ResultContent =
@@ -372,13 +375,18 @@ export function createToolServer(options: McpRuntimeOptions): McpServer {
   const definitions = options.config.tools.filter(
     (definition) => !options.allowedTools || options.allowedTools.has(definition.name),
   );
+  const codeMode = options.codeMode ?? codeModeEnabled();
   const server = new McpServer({
     name: options.config.name,
     version: options.config.version,
   }, {
-    instructions: serverInstructions(definitions),
+    instructions: `${codeMode ? `${CODE_MODE_INSTRUCTIONS} ` : ''}${serverInstructions(definitions)}`,
   });
   registerResourceHandlers(server);
+  if (codeMode) {
+    registerCodeModeTools(server, definitions, options);
+    return server;
+  }
 
   for (const definition of definitions) {
     const publicDefinition = publicToolDefinition(definition);
@@ -413,6 +421,83 @@ export function createToolServer(options: McpRuntimeOptions): McpServer {
   }
 
   return server;
+}
+
+const CODE_MODE_TIMEOUT_MS = 5 * 60_000;
+
+function registerCodeModeTools(
+  server: McpServer,
+  definitions: readonly ToolDefinition[],
+  options: McpRuntimeOptions,
+): void {
+  const catalog = definitions.map(publicToolDefinition);
+  const names = new Set(catalog.map((tool) => tool.name));
+  // Calls from code skip the SDK's per-tool argument check, so validate here.
+  const inputSchemas = new Map(definitions.map((definition) =>
+    [definition.name, fromJsonSchema<Record<string, unknown>>(definition.inputSchema as Record<string, unknown>)]));
+
+  server.registerTool(
+    'search',
+    {
+      description: 'Find Studio tools by keywords. Returns TypeScript signatures to call inside execute. An empty query lists every tool.',
+      inputSchema: fromJsonSchema<{ query: string; limit?: number }>({
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Keywords, e.g. "edit script" or "playtest logs".' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Max signatures; default 8.' },
+        },
+        required: ['query'],
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => ({ content: [{ type: 'text', text: searchTools(catalog, args.query, args.limit ?? 8) }] }),
+  );
+
+  server.registerTool(
+    'execute',
+    {
+      description: 'Run JavaScript (an async function body, or an async arrow function) with studio.<tool>(input) in scope. Return a value or console.log what you need; failed tool calls throw.',
+      inputSchema: fromJsonSchema<{ code: string }>({
+        type: 'object',
+        properties: { code: { type: 'string', description: 'e.g. const r = await studio.get_place_info({}); return r.placeId;' } },
+        required: ['code'],
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (args, context) => {
+      const media: CallToolResult['content'] = [];
+      const call = async (name: string, input: Record<string, unknown>) => {
+        const checked = await inputSchemas.get(name)!['~standard'].validate(input);
+        if (checked.issues) {
+          throw new Error(`${name}: invalid input: ${checked.issues.map((issue) => issue.message).join('; ')}`);
+        }
+        let result: CallToolResult;
+        try {
+          const raw = await options.invoke(options.getTools(), name, checked.value, { signal: context.mcpReq.signal });
+          result = normalizeToolResult(raw, 'modern');
+        } catch (error) {
+          throw new Error(`${name}: ${JSON.stringify(publicToolErrorBody(name, error))}`);
+        }
+        media.push(...result.content.filter((block) => block.type !== 'text'));
+        const text = result.content
+          .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+          .join('\n');
+        if (result.isError) throw new Error(`${name}: ${result.structuredContent ? JSON.stringify(result.structuredContent) : text}`);
+        return result.structuredContent ?? text;
+      };
+
+      const run = await runCode(args.code, call, names, CODE_MODE_TIMEOUT_MS);
+      const lines = [...run.logs];
+      if (run.error !== undefined) lines.push(`Error: ${run.error}`);
+      else if (run.result !== undefined) {
+        lines.push(typeof run.result === 'string' ? run.result : JSON.stringify(run.result) ?? String(run.result));
+      }
+      return {
+        content: [{ type: 'text', text: lines.join('\n') || '(no output)' }, ...media],
+        ...(run.error !== undefined ? { isError: true } : {}),
+      };
+    },
+  );
 }
 
 export function createToolHttpHandler(options: Omit<McpRuntimeOptions, 'era'>): McpHttpHandler {
