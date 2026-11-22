@@ -1,0 +1,7579 @@
+import { readRbxmInput } from '../rbxm-input.js';
+import { StudioHttpClient } from './studio-client.js';
+import { BridgeService, isValidOperationId, MAX_OPERATION_ID_LENGTH, MAX_OPERATION_WAIT_MS, MultiplayerGroupInUseError, RequestFailure, RoutingFailure, StudioOperationError } from '../bridge-service.js';
+import type { PublicStudioPeer, RequestStatus, StudioPeer } from '../bridge-service.js';
+import {
+  openCloudAssetUploadLimitBytes,
+  OpenCloudClient,
+  OpenCloudOperationError,
+  type AssetOperationResponse,
+  type AssetSearchParams,
+  type CreatorStoreSearchCategory,
+} from '../opencloud-client.js';
+import { RobloxCookieClient } from '../roblox-cookie-client.js';
+import {
+  parseStudioProcessEnvironmentPatch,
+  parseStudioTestWorkerJobName,
+  parseStudioWorkingDirectory,
+  StudioInstanceManager,
+  type ManagedStudioInstance,
+  type StudioLaunchSource,
+} from '../studio-instance-manager.js';
+import {
+  decodeImagePathToRgba,
+  decodePngBase64ToRgba,
+  isUniformPng,
+} from '../image-decode.js';
+import { DOC_CATEGORIES, getRobloxDoc, isDocCategory } from '../roblox-docs.js';
+import { findBuiltInStudioSkill, loadBuiltInStudioSkills } from '../studio-skills.js';
+import { runManageExperience } from './experience.js';
+import { runManageMonetization } from './monetization.js';
+import { describePlaytestStartFailure } from './playtest-start-errors.js';
+import { SCRIPT_CLASS_FILTERS } from './definitions.js';
+import { rgbaToJpeg } from '../jpeg-encoder.js';
+import { rgbaToPng } from '../png-encoder.js';
+import { pathNotice } from '../path-notice.js';
+import { readRegularFileWithinLimitAsync } from '../local-file.js';
+import {
+  captureStudioWindow,
+  cropToViewport,
+  findViewportRect,
+  hostCaptureUnsupportedReason,
+  isHostCaptureDisabled,
+  isHostCapturePreferred,
+  isHostCaptureSupported,
+  isNativeLinuxHost,
+  isUniformFrame,
+  linuxHostCaptureUnavailableReason,
+  locateViewportInFrame,
+  prepareHostWindowCapture,
+  saveViewportMarkerFrame,
+} from '../host-capture.js';
+import type { HostCaptureOptions, HostCaptureResult, HostWindowIdentity, ViewportMarkerHint, ViewportRect } from '../host-capture.js';
+import { composeContactSheet, type ContactSheet } from '../contact-sheet.js';
+import {
+  createFfmpegVideoBackend,
+  defaultVideoPath,
+  ffmpegCommand,
+  pruneDefaultVideos,
+  videoRecordingUnsupportedReason,
+} from '../video-recorder.js';
+import type { CaptureSource, MediaInfo, VideoRecorderBackend, VideoRecordingExit, VideoRecordingProcess } from '../video-recorder.js';
+import { analyzeMicroProfilerCapture } from '../micro-profiler/analysis.js';
+import {
+  CaptureTransferError,
+  CLIENT_CHUNK_BYTES,
+  idleAsLongAsRead,
+  isMicroProfilerAction,
+  MICRO_PROFILER_ACTIONS,
+  MICRO_PROFILER_DEFAULT_DURATION_MS,
+  MICRO_PROFILER_MAX_DURATION_MS,
+  MICRO_PROFILER_MIN_DURATION_MS,
+  MICRO_PROFILER_REQUEST_MARGIN_MS,
+  microProfilerAnalysisOptions,
+  parseCaptureTransfer,
+  pullCapture,
+  readWindowSidecar,
+  resolveCapturePath,
+  SERVER_CHUNK_BYTES,
+  windowFromRecording,
+  writeCaptureFile,
+  writeWindowSidecar,
+} from '../micro-profiler/capture.js';
+import type { PaceCaptureChunk } from '../micro-profiler/capture.js';
+import { createHash, randomUUID } from 'crypto';
+import { ReferenceUploadError, ReferenceUploads } from './reference-uploads.js';
+import { publicToolErrorBody } from '../mcp-runtime.js';
+import type { ReferenceUploadAttempt, ReferenceUploadCheckpoint, ReferenceUploadProgress, ReferenceUploadView } from './reference-uploads.js';
+import * as fs from 'fs';
+import * as path from 'path';
+
+/** One exact replacement for edit_script_lines; startLine anchors old_string to a line start. */
+export interface ScriptEdit {
+  oldString: string;
+  newString: string;
+  startLine?: number;
+}
+
+export const MAX_SCRIPT_EDITS = 100;
+const PLUGIN_CONNECTION_TIMEOUT_REASON = 'Studio launched, but the MCP plugin did not connect before timeout.';
+
+type RawImageCaptureResponse = {
+  success?: boolean;
+  error?: string;
+  unavailable?: string;
+  encoding?: 'rgba8' | 'png';
+  source?: string;
+  width?: number;
+  height?: number;
+  nativeWidth?: number;
+  nativeHeight?: number;
+  screenWidth?: number;
+  screenHeight?: number;
+  data?: string;
+  instancePath?: string;
+  instanceName?: string;
+  cameraPreset?: string;
+};
+
+type HostViewportRectCacheEntry = {
+  rect: ViewportRect;
+  identity?: HostWindowIdentity;
+  windowWidth: number;
+  windowHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  cachedAt: number;
+};
+
+type ViewportMarkerResponse = {
+  success?: boolean;
+  error?: string;
+  captureId?: string;
+  viewportChanged?: boolean;
+  stale?: boolean;
+  viewportWidth?: number;
+  viewportHeight?: number;
+  markerSize?: number;
+  markerLayout?: string;
+};
+
+type HostViewportCaptureResult =
+  | { success: true; response: RawImageCaptureResponse }
+  | { success: false; error: string };
+
+// One viewport frame before encoding; hostNote explains how it was captured.
+type RawViewportCaptureOk = {
+  success: true;
+  response: RawImageCaptureResponse;
+  hostNote: string;
+  studioFastPathUnavailable?: string;
+  // Set when a Device Simulator capture was resampled to the full device screen.
+  deviceScreen?: { width: number; height: number };
+};
+type RawViewportCapture = RawViewportCaptureOk | { success: false; error: string; studioFastPathUnavailable?: string };
+
+// `atMs` is when the frame was taken, relative to the first frame.
+type ViewportFramesCapture =
+  | { success: true; frames: Array<{ capture: RawViewportCaptureOk; atMs: number }> }
+  | { success: false; error: string; studioFastPathUnavailable?: string };
+
+export type ScreenshotSequenceOptions = { frames?: number; interval_ms?: number; grid?: boolean };
+
+// Injection seam so tests can stand in for the host OS helper.
+export type HostWindowCaptureFn = (
+  titleHint?: string,
+  expectedIdentity?: HostWindowIdentity,
+  options?: HostCaptureOptions,
+) => Promise<HostCaptureResult>;
+
+function sameHostWindowIdentity(actual: HostWindowIdentity | undefined, expected: HostWindowIdentity): boolean {
+  return actual?.windowId === expected.windowId && actual.processId === expected.processId
+    && actual.bundleIdentifier === expected.bundleIdentifier;
+}
+
+// A cached viewport position is trusted only briefly: Studio's dock layout can
+// change without the window or viewport size changing (e.g. swapping two
+// panels of equal width), and re-locating the viewport costs one extra capture.
+const HOST_VIEWPORT_RECT_TTL_MS = 60_000;
+
+const VIDEO_ACTIONS = ['record', 'start', 'stop', 'storyboard'] as const;
+type VideoAction = typeof VIDEO_ACTIONS[number];
+const VIDEO_DEFAULT_DURATION_MS = 5_000;
+const VIDEO_MIN_DURATION_MS = 500;
+// action=record holds the tool call open; longer takes use start/stop.
+const VIDEO_MAX_DURATION_MS = 30_000;
+// action=start stops itself after this, so a forgotten stop cannot fill the disk.
+const VIDEO_START_MAX_DURATION_MS = 300_000;
+const VIDEO_DEFAULT_FPS = 30;
+const VIDEO_MAX_FPS = 60;
+const VIDEO_DEFAULT_STORYBOARD_FRAMES = 9;
+const VIDEO_MAX_STORYBOARD_FRAMES = 25;
+// Wide enough for legible 3-across tiles, small enough for a vision model's input.
+const VIDEO_STORYBOARD_MAX_WIDTH = 1536;
+const VIDEO_START_GRACE_MS = 750;
+
+type ActiveVideoRecording = {
+  instanceId: string;
+  targetRole: string;
+  outputPath: string;
+  ffmpegPath: string;
+  encoder: string;
+  source: CaptureSource;
+  fps: number;
+  maxDurationMs: number;
+  storyboardFrames: number;
+  startedAt: number;
+  process: VideoRecordingProcess;
+  exit?: VideoRecordingExit;
+};
+
+type VideoViewportLocation =
+  | {
+    success: true; windowId: number; x11Session?: HostWindowIdentity['x11Session']; source: CaptureSource;
+    rect: ViewportRect; frameWidth: number; frameHeight: number;
+  }
+  | { success: false; error: string };
+
+function isVideoAction(value: unknown): value is VideoAction {
+  return typeof value === 'string' && (VIDEO_ACTIONS as readonly string[]).includes(value);
+}
+
+function clampedInteger(value: unknown, name: string, min: number, max: number, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} must be a number`);
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+type ToolContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string }
+  | { type: 'audio'; data: string; mimeType: string };
+
+type EncodedViewportImage = {
+  success: true;
+  width: number;
+  height: number;
+  format: 'jpeg' | 'png';
+  quality?: number;
+  note: string;
+  data: string;
+  mimeType: string;
+  message: string;
+  source?: string;
+  studioFastPathUnavailable?: string;
+};
+
+type EncodedViewportCapture = EncodedViewportImage | {
+  success: false;
+  error: string;
+  studioFastPathUnavailable?: string;
+};
+
+type DeviceSimulatorSettings = {
+  deviceId?: string;
+  orientation?: string;
+  resolution?: { width: number; height: number };
+  pixelDensity?: number;
+  scalingMode?: string;
+};
+
+type DeviceSimulatorMatrixEntry = DeviceSimulatorSettings & {
+  label?: string;
+};
+
+type SimulationInclude = 'network' | 'deviceSimulator' | 'both';
+
+type GenerateModelImage =
+  { kind: 'asset'; asset_id: number };
+
+type StudioToolResponse = Record<string, unknown> & {
+  success?: boolean;
+  error?: string;
+  message?: string;
+  testId?: string;
+  testArgs?: unknown;
+  players?: unknown;
+  playerCount?: number;
+  session?: {
+    phase?: string;
+    testId?: string;
+    numPlayers?: number;
+    testArgs?: unknown;
+    result?: unknown;
+    error?: unknown;
+  };
+};
+
+const MAX_INLINE_IMAGE_BYTES = 6_000_000;
+const MAX_SCREENSHOT_FRAMES = 16;
+const DEFAULT_SCREENSHOT_INTERVAL_MS = 500;
+const MAX_SCREENSHOT_INTERVAL_MS = 5_000;
+const MAX_SCREENSHOT_SEQUENCE_MS = 20_000;
+const MAX_MATRIX_IMAGE_BYTES = 8_000_000;
+const DEFAULT_ASSET_AUDIO_PREVIEWS = 3;
+const MAX_ASSET_AUDIO_PREVIEWS = 5;
+const MAX_INLINE_AUDIO_PREVIEW_BYTES = 3_000_000;
+const MAX_INLINE_AUDIO_PREVIEW_TOTAL_BYTES = 6_000_000;
+const DEFAULT_ASSET_PREVIEW_DEPTH = 4;
+const MAX_ASSET_PREVIEW_HIERARCHY_NODES = 100;
+const MAX_SEARCH_ASSET_DESCRIPTION_LENGTH = 240;
+const ROBLOX_CREATOR_USER_ID = 1;
+
+export type UploadCreator = { userId: string } | { groupId: string };
+
+// Creator for an asset upload. Explicit arguments replace the environment
+// defaults entirely (groupId wins when both are passed); otherwise
+// ROBLOX_CREATOR_GROUP_ID wins over ROBLOX_CREATOR_USER_ID.
+export function resolveUploadCreator(userId?: string, groupId?: string): UploadCreator | undefined {
+  if (groupId) return { groupId };
+  if (userId) return { userId };
+  const envGroupId = process.env.ROBLOX_CREATOR_GROUP_ID;
+  if (envGroupId) return { groupId: envGroupId };
+  const envUserId = process.env.ROBLOX_CREATOR_USER_ID;
+  if (envUserId) return { userId: envUserId };
+  return undefined;
+}
+const MAX_DEVICE_MATRIX_ENTRIES = 6;
+const MAX_NETWORK_PACKET_LOSS_PERCENT = 0.5;
+const GREP_SCRIPTS_TIMEOUT_MS = 120_000;
+const MAX_GREP_PATTERN_UTF8_BYTES = 4096;
+const RUNTIME_LOG_PEER_TIMEOUT_MS = 5_000;
+const STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL = 'Studio Assistant Source Image';
+
+/** Rejects a classFilter that is not one exact script class name. */
+function assertScriptClassFilter(tool: string, classFilter: unknown): void {
+  if (classFilter === undefined) return;
+  if (typeof classFilter !== 'string' || !SCRIPT_CLASS_FILTERS.some((className) => className === classFilter)) {
+    throw new Error(`${tool} classFilter must be one of ${SCRIPT_CLASS_FILTERS.join(', ')}`);
+  }
+}
+
+function optionalRevision(tool: string, value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${tool} expected_revision must be a nonempty string`);
+  }
+  return value;
+}
+
+function optionalRevisionMap(tool: string, value: unknown): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  const invalid = new Error(`${tool} expected_revisions must map script paths to nonempty revision strings`);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid;
+  const revisions: Record<string, string> = {};
+  for (const [scriptPath, revision] of Object.entries(value)) {
+    if (scriptPath.length === 0 || typeof revision !== 'string' || revision.length === 0) throw invalid;
+    revisions[scriptPath] = revision;
+  }
+  return revisions;
+}
+
+const CREATOR_STORE_SEARCH_TYPES = new Set<string>([
+  'Audio',
+  'Model',
+  'Decal',
+  'Plugin',
+  'MeshPart',
+  'Video',
+  'FontFamily',
+  'Image',
+  'Particle',
+  'VFX',
+]);
+const CREATOR_STORE_SORT_CATEGORIES = new Set<string>([
+  'Relevance',
+  'Trending',
+  'Top',
+  'AudioDuration',
+  'CreateTime',
+  'UpdatedTime',
+  'Ratings',
+]);
+function normalizeCreatorStoreSearch(
+  assetType: string,
+  query?: string,
+): {
+  requestedAssetType: string;
+  searchCategoryType: CreatorStoreSearchCategory;
+  effectiveQuery?: string;
+} {
+  if (!CREATOR_STORE_SEARCH_TYPES.has(assetType)) {
+    throw new Error(
+      `search_assets assetType must be one of: ${Array.from(CREATOR_STORE_SEARCH_TYPES).join(', ')}`,
+    );
+  }
+
+  const trimmedQuery = query?.trim() || undefined;
+  if (assetType === 'Image') {
+    return {
+      requestedAssetType: assetType,
+      searchCategoryType: 'Decal',
+      effectiveQuery: trimmedQuery,
+    };
+  }
+
+  if (assetType === 'Particle' || assetType === 'VFX') {
+    const suffix = assetType === 'Particle' ? 'particle effect' : 'VFX';
+    const alreadyEffectSpecific = trimmedQuery !== undefined && /\b(?:particle|vfx|effect)\b/i.test(trimmedQuery);
+    return {
+      requestedAssetType: assetType,
+      searchCategoryType: 'Model',
+      effectiveQuery: trimmedQuery
+        ? alreadyEffectSpecific ? trimmedQuery : `${trimmedQuery} ${suffix}`
+        : suffix,
+    };
+  }
+
+  return {
+    requestedAssetType: assetType,
+    searchCategoryType: assetType as CreatorStoreSearchCategory,
+    effectiveQuery: trimmedQuery,
+  };
+}
+
+function normalizeSearchAssetDescription(description: string | undefined): string {
+  const normalized = description?.replace(/\s+/g, ' ').trim() ?? '';
+  if (normalized.length <= MAX_SEARCH_ASSET_DESCRIPTION_LENGTH) return normalized;
+  return `${normalized.slice(0, MAX_SEARCH_ASSET_DESCRIPTION_LENGTH - 1).trimEnd()}…`;
+}
+
+// Encodes the raw RGBA capture into the requested image format.
+// - 'png': lossless — sharpest text/UI, but a busy 3D scene can be large.
+// - 'jpeg': default; quality 92 with 4:4:4 chroma (no subsampling) keeps text
+//   crisp at ~1/3 the size. The image rides back inline as an MCP tool result,
+//   so JPEG is the safe default for staying under client result-size caps.
+function encodeImageFromRgbaResponse(
+  response: RawImageCaptureResponse,
+  format: 'jpeg' | 'png',
+  quality: number,
+): { buffer: Buffer; mimeType: string } {
+  if (!response.data || response.width === undefined || response.height === undefined) {
+    throw new Error('Render response missing data, width, or height');
+  }
+  const rgbaBuffer = Buffer.from(response.data, 'base64');
+  if (format === 'png') {
+    return { buffer: rgbaToPng(rgbaBuffer, response.width, response.height), mimeType: 'image/png' };
+  }
+  return {
+    buffer: rgbaToJpeg(rgbaBuffer, response.width, response.height, quality),
+    mimeType: 'image/jpeg',
+  };
+}
+
+// Under the Device Simulator the plugin reports the full device screen, the
+// space VirtualInput reads (safe-area insets included). StudioCaptureService
+// squeezes that screen into the viewport size and CaptureService returns it
+// unsqueezed but smaller, so either image is resampled to the screen size.
+// A plugin-side transport downscale (width < nativeWidth) is kept in proportion,
+// with nativeWidth/Height becoming the screen size so the downscale message
+// maps back to screen pixels. Returns undefined when nothing needs resampling.
+function resampleCaptureToDeviceScreen(response: RawImageCaptureResponse): RawImageCaptureResponse | undefined {
+  const { screenWidth, screenHeight, width, height, data } = response;
+  if (!screenWidth || !screenHeight || !width || !height || !data || response.source === 'host-window') return undefined;
+  const targetWidth = Math.max(1, Math.round(screenWidth * width / (response.nativeWidth ?? width)));
+  const targetHeight = Math.max(1, Math.round(screenHeight * height / (response.nativeHeight ?? height)));
+
+  let source: { width: number; height: number; rgba: Buffer };
+  if (response.encoding === 'png') {
+    source = decodePngBase64ToRgba(data);
+  } else {
+    source = { width, height, rgba: Buffer.from(data, 'base64') };
+    if (source.rgba.length !== width * height * 4) {
+      throw new Error(`raw capture is ${source.rgba.length} bytes, expected ${width * height * 4} for ${width}x${height}`);
+    }
+  }
+  const resampled = cropToViewport(
+    source.rgba, source.width, source.height,
+    { x: 0, y: 0, width: source.width, height: source.height },
+    targetWidth, targetHeight,
+  );
+  return {
+    ...response,
+    encoding: 'rgba8',
+    width: resampled.width,
+    height: resampled.height,
+    nativeWidth: screenWidth,
+    nativeHeight: screenHeight,
+    data: resampled.rgba.toString('base64'),
+  };
+}
+
+// An aborted signal rejects with its reason at once, so cancelled waits stop polling.
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  if (signal?.aborted) {
+    reject(signal.reason);
+    return promise;
+  }
+  const onAbort = () => {
+    clearTimeout(timer);
+    reject(signal?.reason);
+  };
+  const timer = setTimeout(() => {
+    signal?.removeEventListener('abort', onAbort);
+    resolve();
+  }, ms);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  return promise;
+}
+
+// Resolves with the promise's value if it settles within ms, otherwise undefined.
+async function settledWithin<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  const timeout = Promise.withResolvers<undefined>();
+  const timer = setTimeout(() => timeout.resolve(undefined), ms);
+  try {
+    return await Promise.race([promise, timeout.promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const MAX_FAILURE_MESSAGE_LENGTH = 500;
+
+function boundedMessage(message: string): string {
+  return message.slice(0, MAX_FAILURE_MESSAGE_LENGTH);
+}
+
+// A failure's code, so callers can tell permission (forbidden_endpoint),
+// version (primary_unsupported), service (service_unavailable), routing, and
+// transport (request_timeout, peer_unregistered, ...) failures apart.
+function failureCode(error: unknown, fallback: string): string {
+  if (error instanceof RequestFailure || error instanceof StudioOperationError) return error.code;
+  if (error instanceof RoutingFailure) return error.routingError.code;
+  return fallback;
+}
+
+function codedError(error: unknown): { code: string; message: string } {
+  return { code: failureCode(error, 'studio_error'), message: boundedMessage(errorMessage(error)) };
+}
+
+// A fanned-out Peer request that rejected, shaped like a Studio handler failure.
+function peerRequestFailure(reason: unknown): { error: string; message: string } {
+  return { error: failureCode(reason, 'request_failed'), message: boundedMessage(errorMessage(reason)) };
+}
+
+function unretainedStatus(requestId: string): Record<string, unknown> {
+  return {
+    requestId,
+    state: 'unknown',
+    outcome: 'unknown',
+    message: 'No retained operation record. It may have expired, been evicted, or belonged to an earlier server session. Do not infer that the mutation was not executed.',
+  };
+}
+
+// For an upload no retry can join, its progress has no one to inform.
+const UNTRACKED_UPLOAD: ReferenceUploadProgress = {
+  sending: () => undefined,
+  accepted: () => undefined,
+  created: () => undefined,
+};
+
+// Bridge refusals at admission: no operation record was created, so nothing
+// under that ID can run. Any other failure may follow an admitted operation.
+const NOT_ADMITTED_FAILURE_CODES = new Set([
+  'invalid_operation_id', 'request_serialization_failed', 'request_too_large',
+  'request_capacity_exceeded', 'primary_unsupported', 'forbidden_endpoint',
+]);
+
+function generationNotAdmitted(error: unknown): boolean {
+  if (error instanceof RoutingFailure) return true;
+  return error instanceof RequestFailure && NOT_ADMITTED_FAILURE_CODES.has(error.code)
+    && error.details.stage === 'queued' && error.details.outcome === 'not_executed';
+}
+
+// pending: Studio may still be generating. A wait that ended without a result
+// is failed when nothing ran, otherwise unknown: a late result can still settle it.
+function generationPhase(status: RequestStatus): 'generating' | 'completed' | 'failed' | 'unknown' {
+  if (status.state === 'pending') return 'generating';
+  if (status.state === 'settled') return status.outcome === 'success' ? 'completed' : 'failed';
+  return status.outcome === 'not_executed' || status.executionOutcome === 'not_executed' ? 'failed' : 'unknown';
+}
+
+// edit, server, then clients in numeric order.
+function roleOrder(role: string): number {
+  if (role === 'edit') return 0;
+  if (role === 'server') return 1;
+  const client = /^client-(\d+)$/.exec(role);
+  return client ? 2 + Number(client[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+// Budgeted tools (playtest lifecycle, wait_until) answer with text items only.
+type ToolCallResult = { content: Array<{ type: string; text: string }> };
+
+type ToolJobOutcome = { result: ToolCallResult } | { error: unknown };
+
+// A long tool call that outlived its response budget; get_request_status collects it.
+type ToolJob = {
+  id: string;
+  key: string;
+  tool: string;
+  action: string;
+  startedAt: number;
+  done: Promise<void>;
+  settledAt?: number;
+  outcome?: ToolJobOutcome;
+};
+
+const TOOL_JOB_RETENTION_MS = 5 * 60_000;
+const DEFAULT_RESPONSE_BUDGET_MS = 25_000;
+
+// MCP clients give up on a call after their own timeout and then report an
+// unknown outcome. Long calls therefore answer within this budget: work still
+// running returns a request id and get_request_status delivers the result.
+export function responseBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.ROBLOX_STUDIO_MCP_RESPONSE_BUDGET_MS);
+  return Number.isFinite(raw) && raw > 0
+    ? Math.min(3_600_000, Math.max(1_000, Math.floor(raw)))
+    : DEFAULT_RESPONSE_BUDGET_MS;
+}
+
+/** eval_*_runtime wait_until polling. */
+export interface RuntimeWaitOptions {
+  wait_until?: string;
+  timeout_s?: number;
+  poll_ms?: number;
+}
+
+const DEFAULT_WAIT_TIMEOUT_S = 20;
+// One wait never outlasts the longest operation wait the bridge allows.
+const MAX_WAIT_TIMEOUT_S = MAX_OPERATION_WAIT_MS / 1000;
+const DEFAULT_WAIT_POLL_MS = 250;
+// Every probe is a bridge request whose result the bridge retains (at most
+// 1024, oldest evicted first). Long waits poll less often so one wait cannot
+// push out much of that history, including a retry's operation_id result.
+const MAX_WAIT_PROBES = 120;
+// Fallback for replies that lack the plugin's eval shape: Luau parse
+// diagnostics as `<chunk>:<line>: <message>`, or the engine's generic load failure.
+const WAIT_COMPILE_ERROR = /:\d+: (Expected|Incomplete statement|Malformed|Unfinished|Cannot use '\.\.\.' outside of a vararg function|String literal contains malformed escape sequence|Attribute name is missing)|Requested module experienced an error while loading/;
+// Plugin-side failures that also come back without output but are not about the payload.
+const EVAL_SETUP_ERROR = /^(ModuleScript Source set failed|Eval bridge returned invalid result)/;
+const PLAYTEST_NOT_RUNNING_ERROR = 'eval_*_runtime requires a running playtest.';
+const WAIT_YIELD_ERROR = 'wait_until must not yield';
+
+export type WaitProbeForm = 'expression' | 'block';
+
+// Runs the condition as a function body (the expression form gains
+// `return (...)`), keeping it on line 1 so Luau error lines match the caller's
+// text. The body runs in a coroutine: a condition that waits (WaitForChild,
+// task.wait, InvokeServer) is cancelled instead of staying suspended in the
+// game and holding a plugin request slot after the probe gave up on it. The
+// reply is "T" or "F" for truthiness followed by the value as text.
+export function buildWaitProbe(condition: string, form: WaitProbeForm = 'expression'): string {
+  const body = form === 'block' ? condition : `return (${condition}\n)`;
+  return `local __mcp_thread = coroutine.create(function() ${body}
+end)
+local __mcp_ok, __mcp_value = coroutine.resume(__mcp_thread)
+if coroutine.status(__mcp_thread) ~= "dead" then
+\ttask.cancel(__mcp_thread)
+\terror("${WAIT_YIELD_ERROR}: it called something that waits, such as WaitForChild, task.wait, or a remote call. Use FindFirstChild or read the state directly.", 0)
+end
+if not __mcp_ok then
+\terror(__mcp_value, 0)
+end
+local __mcp_shown
+if type(__mcp_value) == "table" then
+\tlocal ok, encoded = pcall(function() return game:GetService("HttpService"):JSONEncode(__mcp_value) end)
+\t__mcp_shown = if ok then encoded else tostring(__mcp_value)
+else
+\t__mcp_shown = tostring(__mcp_value)
+end
+return (if __mcp_value then "T" else "F") .. __mcp_shown`;
+}
+
+// The plugin's eval wrapper runs the payload under xpcall and always replies
+// with an output array, so a runtime error carries output. A payload that
+// failed to load (a compile error) is reported by the bridge without one.
+function isWaitLoadFailure(response: StudioToolResponse): boolean {
+  if (response.ok === true || response.output !== undefined) return false;
+  const error = typeof response.error === 'string' ? response.error : '';
+  if (response.bridge === 'ok' && response.ok === false) return !EVAL_SETUP_ERROR.test(error);
+  return WAIT_COMPILE_ERROR.test(error);
+}
+
+// Resolves after ms, or as soon as the signal aborts.
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setTimeout(done, ms);
+  signal?.addEventListener('abort', done, { once: true });
+  function done() {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', done);
+    resolve();
+  }
+  return promise;
+}
+
+/** A runtime peer a playtest start proved can run code, and how to address it. */
+export interface RuntimeReadyTarget {
+  role: string;
+  instance_id: string;
+  target: string;
+}
+
+type RuntimeEvalReadiness = {
+  ready: boolean;
+  targets: RuntimeReadyTarget[];
+  notReady: Array<{ role: string; error: string }>;
+  // Pending roles that left the scope; they do not come back, so the wait ended early.
+  disconnected: string[];
+};
+
+// Readiness-failure fields: the playtest is left running so the agent can inspect it,
+// and a new start is refused until it stops.
+function runtimeEvalFailure(readiness: RuntimeEvalReadiness, running: boolean, stopAction: 'stop' | 'end') {
+  return {
+    running,
+    disconnected: readiness.disconnected.length > 0 ? readiness.disconnected : undefined,
+    recoveryHint: !running
+      ? undefined
+      : readiness.disconnected.length > 0
+        ? `The playtest is still running without ${readiness.disconnected.join(', ')}; ${stopAction} the playtest and start again to get every peer back.`
+        : `The playtest is still running; retry eval on the notReady peers, or ${stopAction} the playtest before starting again.`,
+  };
+}
+
+const DEFAULT_PLAYTEST_READY_TIMEOUT_S = 90;
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function asRows(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.map(asRecord).filter((row): row is Record<string, unknown> => row !== undefined)
+    : [];
+}
+
+function numberField(row: Record<string, unknown> | undefined, key: string): number {
+  const value = row?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function optionalNumberField(
+  row: Record<string, unknown> | undefined,
+  key: string,
+): number | undefined {
+  const value = row?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function stringField(row: Record<string, unknown> | undefined, key: string): string {
+  const value = row?.[key];
+  return typeof value === 'string' && value !== '' ? value : '';
+}
+
+function robloxAssetIdFromContentId(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value !== 'string') return undefined;
+
+  const trimmed = value.trim();
+  const direct = /^(?:rbxassetid:\/\/)?(\d+)$/.exec(trimmed);
+  const query = /[?&]id=(\d+)(?:&|$)/i.exec(trimmed);
+  const rawId = direct?.[1] ?? query?.[1];
+  if (!rawId) return undefined;
+
+  const parsed = Number(rawId);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function compactPreviewHierarchy(value: unknown): {
+  hierarchy: Record<string, unknown>[];
+  truncated: boolean;
+} {
+  let remaining = MAX_ASSET_PREVIEW_HIERARCHY_NODES;
+  let truncated = false;
+
+  const compactNode = (row: Record<string, unknown>): Record<string, unknown> | undefined => {
+    if (remaining <= 0) {
+      truncated = true;
+      return undefined;
+    }
+    remaining--;
+
+    const node: Record<string, unknown> = {
+      name: stringField(row, 'name'),
+      className: stringField(row, 'className'),
+    };
+    const properties = asRecord(row.properties);
+    if (properties && Object.keys(properties).length > 0) {
+      node.properties = properties;
+    }
+
+    const children = asRows(row.children);
+    if (children.length > 0) {
+      const compactedChildren: Record<string, unknown>[] = [];
+      for (const child of children) {
+        const compacted = compactNode(child);
+        if (!compacted) break;
+        compactedChildren.push(compacted);
+      }
+      if (compactedChildren.length > 0) {
+        node.children = compactedChildren;
+      }
+      if (compactedChildren.length < children.length) {
+        node.childCount = children.length;
+        node.truncated = true;
+        truncated = true;
+      }
+    } else if (row.truncated === true) {
+      node.truncated = true;
+      const childCount = numberField(row, 'childCount');
+      if (childCount > 0) node.childCount = childCount;
+    }
+    return node;
+  };
+
+  const hierarchy: Record<string, unknown>[] = [];
+  for (const root of asRows(value)) {
+    const compacted = compactNode(root);
+    if (!compacted) break;
+    hierarchy.push(compacted);
+  }
+  return { hierarchy, truncated };
+}
+
+function compactSoundReference(sound: Record<string, unknown>): Record<string, unknown> {
+  const compact: Record<string, unknown> = {
+    name: stringField(sound, 'name'),
+    className: stringField(sound, 'className'),
+  };
+  const path = stringField(sound, 'path');
+  if (path) compact.path = path;
+  const assetId = robloxAssetIdFromContentId(
+    sound.assetId ?? sound.soundId ?? sound.asset,
+  );
+  if (assetId !== undefined) compact.assetId = assetId;
+
+  const volume = optionalNumberField(sound, 'volume');
+  if (volume !== undefined && volume !== 1) compact.volume = volume;
+  const playbackSpeed = optionalNumberField(sound, 'playbackSpeed');
+  if (playbackSpeed !== undefined && playbackSpeed !== 1) {
+    compact.playbackSpeed = playbackSpeed;
+  }
+  const timeLength = optionalNumberField(sound, 'timeLength');
+  if (timeLength !== undefined && timeLength > 0) compact.duration = timeLength;
+  if (sound.looped === true) compact.looped = true;
+  if (sound.autoPlay === true) compact.autoPlay = true;
+  return compact;
+}
+
+function microProfilerDurationMs(body: Record<string, unknown> | undefined): number {
+  const analysisWindow = asRecord(body?.analysis_window);
+  const analysisDurationUs = analysisWindow?.analysis_duration_us;
+  if (typeof analysisDurationUs === 'number' && Number.isFinite(analysisDurationUs) && analysisDurationUs > 0) {
+    return analysisDurationUs / 1000;
+  }
+  const duration = body?.duration_ms;
+  return typeof duration === 'number' && Number.isFinite(duration) && duration > 0 ? duration : 1000;
+}
+
+function perSecond(totalUs: number, durationMs: number): number {
+  return durationMs > 0 ? totalUs / (durationMs / 1000) : totalUs;
+}
+
+function roundNumber(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function percentDelta(current: number, baseline: number): number | undefined {
+  if (baseline === 0) return current === 0 ? 0 : undefined;
+  return roundNumber(((current - baseline) / baseline) * 100);
+}
+
+function inclusiveUsField(row: Record<string, unknown> | undefined): number {
+  const inclusive = numberField(row, 'inclusive_us');
+  return inclusive !== 0 ? inclusive : numberField(row, 'total_us');
+}
+
+function rowSet(body: Record<string, unknown>, key: 'groups' | 'timers' | 'threads' | 'call_edges', fallback: string): Record<string, unknown>[] {
+  const comparisonIndex = asRecord(body.comparison_index);
+  const indexed = asRows(comparisonIndex?.[key]);
+  return indexed.length > 0 ? indexed : asRows(body[fallback]);
+}
+
+function nestedRecord(row: Record<string, unknown> | undefined, key: string): Record<string, unknown> | undefined {
+  return asRecord(row?.[key]);
+}
+
+function loadMicroProfilerBaseline(source: unknown, sourcePath: unknown): Record<string, unknown> | undefined {
+  if (source !== undefined) {
+    const inline = asRecord(source);
+    if (!inline) throw new Error('baseline must be an object when provided');
+    return inline;
+  }
+  if (sourcePath !== undefined) {
+    if (typeof sourcePath !== 'string' || sourcePath === '') {
+      throw new Error('baseline_path must be a non-empty string when provided');
+    }
+    const resolved = path.resolve(sourcePath);
+    const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8')) as unknown;
+    const record = asRecord(parsed);
+    if (!record) throw new Error(`baseline_path did not contain a JSON object: ${resolved}`);
+    return record;
+  }
+  return undefined;
+}
+
+// Schema 2 summaries convert MicroProfiler ticks with the snapshot's clock.
+// Schema 1 assumed nanosecond ticks, inflating CPU absolute times (and deflating
+// count_per_s) by the CPU timer's GHz rate. CPU per-second rates are ratios of
+// two equally scaled values, so they stay comparable across versions. GPU ticks
+// were already nanoseconds, so schema-1 GPU rates were divided by an inflated
+// duration and are not comparable.
+function microProfilerSchema(body: Record<string, unknown>): 'snapshot_clock' | 'legacy' | undefined {
+  // A failed capture (error body) is not a summary of either kind.
+  if (typeof body.error === 'string') return undefined;
+  return numberField(body, 'schema_version') >= 2 ? 'snapshot_clock' : 'legacy';
+}
+
+function compareMicroProfilerRows(
+  currentRows: Record<string, unknown>[],
+  baselineRows: Record<string, unknown>[],
+  currentDurationMs: number,
+  baselineDurationMs: number,
+  keyForRow: (row: Record<string, unknown>) => string,
+  labelForRow: (row: Record<string, unknown>, fallbackKey: string) => Record<string, unknown>,
+  maxRows: number,
+  legacySide?: 'current' | 'baseline',
+): Record<string, unknown>[] {
+  const currentByKey = new Map<string, Record<string, unknown>>();
+  const baselineByKey = new Map<string, Record<string, unknown>>();
+  for (const row of currentRows) {
+    const key = keyForRow(row);
+    if (key) currentByKey.set(key, row);
+  }
+  for (const row of baselineRows) {
+    const key = keyForRow(row);
+    if (key) baselineByKey.set(key, row);
+  }
+
+  const usesFullIndex = currentRows.length > 0 && baselineRows.length > 0;
+  const keys = new Set<string>([...currentByKey.keys(), ...baselineByKey.keys()]);
+  const deltas: Record<string, unknown>[] = [];
+  for (const key of keys) {
+    const current = currentByKey.get(key);
+    const baseline = baselineByKey.get(key);
+    const currentInclusiveUs = inclusiveUsField(current);
+    const baselineInclusiveUs = inclusiveUsField(baseline);
+    const currentExclusiveUs = numberField(current, 'exclusive_us');
+    const baselineExclusiveUs = numberField(baseline, 'exclusive_us');
+    const currentCount = numberField(current, 'count');
+    const baselineCount = numberField(baseline, 'count');
+    const currentUsPerS = perSecond(currentInclusiveUs, currentDurationMs);
+    const baselineUsPerS = perSecond(baselineInclusiveUs, baselineDurationMs);
+    const currentExclusiveUsPerS = perSecond(currentExclusiveUs, currentDurationMs);
+    const baselineExclusiveUsPerS = perSecond(baselineExclusiveUs, baselineDurationMs);
+    const currentCountPerS = perSecond(currentCount, currentDurationMs);
+    const baselineCountPerS = perSecond(baselineCount, baselineDurationMs);
+    const row: Record<string, unknown> = {
+      ...labelForRow(current ?? baseline!, key),
+      matched_by: 'stable_label',
+      match_confidence: 'medium',
+      current_inclusive_us: currentInclusiveUs,
+      baseline_inclusive_us: baselineInclusiveUs,
+      delta_inclusive_us: currentInclusiveUs - baselineInclusiveUs,
+      current_inclusive_us_per_s: roundNumber(currentUsPerS),
+      baseline_inclusive_us_per_s: roundNumber(baselineUsPerS),
+      delta_inclusive_us_per_s: roundNumber(currentUsPerS - baselineUsPerS),
+      current_exclusive_us: currentExclusiveUs,
+      baseline_exclusive_us: baselineExclusiveUs,
+      delta_exclusive_us: currentExclusiveUs - baselineExclusiveUs,
+      current_exclusive_us_per_s: roundNumber(currentExclusiveUsPerS),
+      baseline_exclusive_us_per_s: roundNumber(baselineExclusiveUsPerS),
+      delta_exclusive_us_per_s: roundNumber(currentExclusiveUsPerS - baselineExclusiveUsPerS),
+      current_count: currentCount,
+      baseline_count: baselineCount,
+      delta_count: currentCount - baselineCount,
+      current_count_per_s: roundNumber(currentCountPerS),
+      baseline_count_per_s: roundNumber(baselineCountPerS),
+      delta_count_per_s: roundNumber(currentCountPerS - baselineCountPerS),
+    };
+    if (!usesFullIndex) row.match_scope = 'returned_rows';
+    if (legacySide !== undefined) {
+      for (const field of [
+        `${legacySide}_inclusive_us`, `${legacySide}_exclusive_us`, `${legacySide}_count_per_s`,
+        'delta_inclusive_us', 'delta_exclusive_us', 'delta_count_per_s',
+      ]) {
+        delete row[field];
+      }
+    }
+    const pct = percentDelta(currentUsPerS, baselineUsPerS);
+    if (pct !== undefined) row.delta_pct = pct;
+    deltas.push(row);
+  }
+
+  deltas.sort((a, b) => Math.abs(numberField(b, 'delta_inclusive_us_per_s')) - Math.abs(numberField(a, 'delta_inclusive_us_per_s')));
+  return deltas.slice(0, maxRows);
+}
+
+function compareMicroProfilerCaptures(
+  current: Record<string, unknown>,
+  baseline: Record<string, unknown>,
+  options: { currentLabel?: string; baselineLabel?: string; maxRows?: number } = {},
+): Record<string, unknown> {
+  const currentDurationMs = microProfilerDurationMs(current);
+  const baselineDurationMs = microProfilerDurationMs(baseline);
+  const maxRows = Math.max(1, Math.min(100, Math.trunc(options.maxRows ?? 20)));
+  const currentSchema = microProfilerSchema(current);
+  const baselineSchema = microProfilerSchema(baseline);
+  const legacySide = currentSchema === 'snapshot_clock' && baselineSchema === 'legacy'
+    ? 'baseline'
+    : baselineSchema === 'snapshot_clock' && currentSchema === 'legacy' ? 'current' : undefined;
+
+  const groupDeltas = compareMicroProfilerRows(
+    rowSet(current, 'groups', 'top_groups'),
+    rowSet(baseline, 'groups', 'top_groups'),
+    currentDurationMs,
+    baselineDurationMs,
+    (row) => stringField(row, 'group'),
+    (row, key) => ({ group: stringField(row, 'group') || key }),
+    maxRows,
+    legacySide,
+  );
+
+  const timerDeltas = compareMicroProfilerRows(
+    rowSet(current, 'timers', 'top_timers'),
+    rowSet(baseline, 'timers', 'top_timers'),
+    currentDurationMs,
+    baselineDurationMs,
+    (row) => `${stringField(row, 'group')}::${stringField(row, 'name') || stringField(row, 'timer_id')}`,
+    (row, key) => ({
+      group: stringField(row, 'group') || key.split('::')[0],
+      name: stringField(row, 'name') || key.split('::')[1],
+      timer_id: row.timer_id,
+    }),
+    maxRows,
+    legacySide,
+  );
+
+  const threadDeltas = compareMicroProfilerRows(
+    rowSet(current, 'threads', 'top_threads'),
+    rowSet(baseline, 'threads', 'top_threads'),
+    currentDurationMs,
+    baselineDurationMs,
+    (row) => stringField(row, 'thread_name') || String(numberField(row, 'thread_id')),
+    (row, key) => ({
+      thread_id: row.thread_id,
+      thread_name: stringField(row, 'thread_name') || key,
+      is_gpu: row.is_gpu,
+    }),
+    maxRows,
+    legacySide,
+  );
+
+  const edgeDeltas = compareMicroProfilerRows(
+    rowSet(current, 'call_edges', 'top_call_edges'),
+    rowSet(baseline, 'call_edges', 'top_call_edges'),
+    currentDurationMs,
+    baselineDurationMs,
+    (row) => {
+      const parent = nestedRecord(row, 'parent');
+      const child = nestedRecord(row, 'child');
+      return [
+        stringField(parent, 'group'),
+        stringField(parent, 'name') || stringField(parent, 'timer_id'),
+        '>',
+        stringField(child, 'group'),
+        stringField(child, 'name') || stringField(child, 'timer_id'),
+      ].join('::');
+    },
+    (row, key) => ({
+      parent: nestedRecord(row, 'parent') ?? { label: key },
+      child: nestedRecord(row, 'child') ?? { label: key },
+    }),
+    maxRows,
+    legacySide,
+  );
+
+  const currentHasIndex = asRecord(current.comparison_index) !== undefined;
+  const baselineHasIndex = asRecord(baseline.comparison_index) !== undefined;
+  const comparison: Record<string, unknown> = {
+    baseline_label: options.baselineLabel ?? 'baseline',
+    current_label: options.currentLabel ?? 'current',
+    basis: 'inclusive_us_per_second normalized by each capture analysis duration; deltas use current minus baseline.',
+    coverage: {
+      current: currentHasIndex ? 'comparison_index' : 'returned_rows',
+      baseline: baselineHasIndex ? 'comparison_index' : 'returned_rows',
+    },
+    duration_ms: {
+      baseline: baselineDurationMs,
+      current: currentDurationMs,
+    },
+    groups: groupDeltas,
+    timers: timerDeltas,
+    threads: threadDeltas,
+    call_edges: edgeDeltas,
+  };
+  if (legacySide !== undefined) {
+    comparison.warnings = [
+      `The ${legacySide} summary predates schema_version 2 and assumed nanosecond MicroProfiler ticks, so its CPU absolute times and count_per_s are scaled by the CPU timer rate. Absolute and count-rate deltas are omitted; *_us_per_s deltas and delta_pct remain comparable for CPU work, but not for GPU-thread rows (include_gpu). Recapture it for full comparisons.`,
+    ];
+  }
+  return comparison;
+}
+
+const NETWORK_PROFILE_KEYS = [
+  'InboundNetworkMinDelayMs',
+  'OutboundNetworkMinDelayMs',
+  'InboundNetworkJitterMs',
+  'OutboundNetworkJitterMs',
+  'InboundNetworkLossPercent',
+  'OutboundNetworkLossPercent',
+] as const;
+
+type NetworkProfileKey = typeof NETWORK_PROFILE_KEYS[number];
+type NetworkProfileValues = Partial<Record<NetworkProfileKey, number>>;
+
+const NETWORK_PROFILES: Record<'great' | 'good' | 'poor', Record<NetworkProfileKey, number>> = {
+  great: {
+    InboundNetworkMinDelayMs: 15,
+    OutboundNetworkMinDelayMs: 15,
+    InboundNetworkJitterMs: 0,
+    OutboundNetworkJitterMs: 0,
+    InboundNetworkLossPercent: 0,
+    OutboundNetworkLossPercent: 0,
+  },
+  good: {
+    InboundNetworkMinDelayMs: 50,
+    OutboundNetworkMinDelayMs: 50,
+    InboundNetworkJitterMs: 10,
+    OutboundNetworkJitterMs: 10,
+    InboundNetworkLossPercent: 0,
+    OutboundNetworkLossPercent: 0,
+  },
+  poor: {
+    InboundNetworkMinDelayMs: 150,
+    OutboundNetworkMinDelayMs: 150,
+    InboundNetworkJitterMs: 100,
+    OutboundNetworkJitterMs: 100,
+    InboundNetworkLossPercent: 0.5,
+    OutboundNetworkLossPercent: 0.5,
+  },
+};
+
+const ZERO_NETWORK_PROFILE: Record<NetworkProfileKey, number> = {
+  InboundNetworkMinDelayMs: 0,
+  OutboundNetworkMinDelayMs: 0,
+  InboundNetworkJitterMs: 0,
+  OutboundNetworkJitterMs: 0,
+  InboundNetworkLossPercent: 0,
+  OutboundNetworkLossPercent: 0,
+};
+
+const SIMULATION_PERSISTENCE_NOTES = [
+  'Normal Play client changes can write back to edit state.',
+  'Multiplayer clients inherit baseline at startup but are isolated afterward.',
+  'StudioTestService client device simulator state may appear stale on fresh clients, so reset after client startup is required.',
+];
+
+function normalizeNetworkProfile(profile: string, overrides?: Record<string, unknown>): NetworkProfileValues {
+  if (!['great', 'good', 'poor', 'custom'].includes(profile)) {
+    throw new Error('profile must be "great", "good", "poor", or "custom"');
+  }
+
+  const values: NetworkProfileValues = profile === 'custom'
+    ? {}
+    : { ...NETWORK_PROFILES[profile as 'great' | 'good' | 'poor'] };
+
+  if (overrides !== undefined) {
+    if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) {
+      throw new Error('overrides must be an object when provided');
+    }
+    const allowed = new Set<string>(NETWORK_PROFILE_KEYS);
+    for (const [key, value] of Object.entries(overrides)) {
+      if (!allowed.has(key)) {
+        throw new Error(`Unsupported network override "${key}". Allowed: ${NETWORK_PROFILE_KEYS.join(', ')}`);
+      }
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new Error(`Network override "${key}" must be a finite number`);
+      }
+      if (value < 0) {
+        throw new Error(`Network override "${key}" must be greater than or equal to 0`);
+      }
+      if ((key === 'InboundNetworkLossPercent' || key === 'OutboundNetworkLossPercent') && value > MAX_NETWORK_PACKET_LOSS_PERCENT) {
+        throw new Error(`Network override "${key}" cannot exceed ${MAX_NETWORK_PACKET_LOSS_PERCENT}; Roblox engine limits packet loss simulation to 0.5%.`);
+      }
+      values[key as NetworkProfileKey] = value;
+    }
+  }
+
+  if (Object.keys(values).length === 0) {
+    throw new Error('custom profile requires at least one override');
+  }
+
+  return values;
+}
+
+function buildNetworkProfileLuau(profile: string, values: NetworkProfileValues): string {
+  const valuesJson = JSON.stringify(values);
+  const keysJson = JSON.stringify(NETWORK_PROFILE_KEYS);
+  return `
+local HttpService = game:GetService("HttpService")
+local ns = settings():GetService("NetworkSettings")
+local keys = HttpService:JSONDecode(${JSON.stringify(keysJson)})
+local desired = HttpService:JSONDecode(${JSON.stringify(valuesJson)})
+local before = {}
+for _, key in ipairs(keys) do
+\tbefore[key] = ns[key]
+end
+for key, value in pairs(desired) do
+\tns[key] = value
+end
+local after = {}
+for _, key in ipairs(keys) do
+\tafter[key] = ns[key]
+end
+return HttpService:JSONEncode({
+\tprofile = ${JSON.stringify(profile)},
+\tapplied = desired,
+\tbefore = before,
+\tafter = after,
+})
+`.trim();
+}
+
+function buildNetworkStateLuau(operation: 'get' | 'reset'): string {
+  const keysJson = JSON.stringify(NETWORK_PROFILE_KEYS);
+  const resetJson = JSON.stringify(ZERO_NETWORK_PROFILE);
+  return `
+local HttpService = game:GetService("HttpService")
+local ns = settings():GetService("NetworkSettings")
+local operation = ${JSON.stringify(operation)}
+local keys = HttpService:JSONDecode(${JSON.stringify(keysJson)})
+local resetValues = HttpService:JSONDecode(${JSON.stringify(resetJson)})
+
+local function readState()
+\tlocal state = {}
+\tfor _, key in ipairs(keys) do
+\t\tstate[key] = ns[key]
+\tend
+\treturn state
+end
+
+if operation == "get" then
+\treturn HttpService:JSONEncode({
+\t\tsuccess = true,
+\t\tstate = readState(),
+\t})
+end
+
+if operation == "reset" then
+\tlocal before = readState()
+\tfor key, value in pairs(resetValues) do
+\t\tns[key] = value
+\tend
+\treturn HttpService:JSONEncode({
+\t\tsuccess = true,
+\t\tapplied = resetValues,
+\t\tbefore = before,
+\t\tafter = readState(),
+\t})
+end
+
+error("Unsupported network simulation operation: " .. tostring(operation), 0)
+`.trim();
+}
+
+// Only for captures resampled into the simulated device screen.
+function deviceScreenNote(screen?: { width: number; height: number }): string {
+  if (screen === undefined) return '';
+  return ` Device Simulator: the image covers the full ${screen.width}x${screen.height} device screen ` +
+    `(safe-area insets included), the same space simulate_mouse_input uses, so coordinates read off it work directly.`;
+}
+
+function normalizeDeviceSimulatorResolution(value: unknown): { width: number; height: number } | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('resolution must be an object with positive integer width and height');
+  }
+  const resolution = value as { width?: unknown; height?: unknown };
+  const width = resolution.width;
+  const height = resolution.height;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || (width as number) <= 0 || (height as number) <= 0) {
+    throw new Error('resolution.width and resolution.height must be positive integers');
+  }
+  return { width: width as number, height: height as number };
+}
+
+function normalizeDeviceSimulatorSettings(input: {
+  deviceId?: unknown;
+  orientation?: unknown;
+  resolution?: unknown;
+  pixelDensity?: unknown;
+  scalingMode?: unknown;
+}): DeviceSimulatorSettings {
+  const settings: DeviceSimulatorSettings = {};
+
+  if (input.deviceId !== undefined) {
+    if (typeof input.deviceId !== 'string' || input.deviceId.trim() === '') {
+      throw new Error('deviceId must be a non-empty string');
+    }
+    settings.deviceId = input.deviceId;
+  }
+
+  if (input.orientation !== undefined) {
+    if (typeof input.orientation !== 'string' || input.orientation.trim() === '') {
+      throw new Error('orientation must be a non-empty string');
+    }
+    settings.orientation = input.orientation;
+  }
+
+  const resolution = normalizeDeviceSimulatorResolution(input.resolution);
+  if (resolution !== undefined) settings.resolution = resolution;
+
+  if (input.pixelDensity !== undefined) {
+    if (typeof input.pixelDensity !== 'number' || !Number.isFinite(input.pixelDensity) || input.pixelDensity <= 0) {
+      throw new Error('pixelDensity must be a positive finite number');
+    }
+    settings.pixelDensity = input.pixelDensity;
+  }
+
+  if (input.scalingMode !== undefined) {
+    if (typeof input.scalingMode !== 'string' || input.scalingMode.trim() === '') {
+      throw new Error('scalingMode must be a non-empty string');
+    }
+    settings.scalingMode = input.scalingMode;
+  }
+
+  return settings;
+}
+
+function hasDeviceSimulatorSettings(settings: DeviceSimulatorSettings): boolean {
+  return settings.deviceId !== undefined ||
+    settings.orientation !== undefined ||
+    settings.resolution !== undefined ||
+    settings.pixelDensity !== undefined ||
+    settings.scalingMode !== undefined;
+}
+
+function buildDeviceSimulatorLuau(operation: 'get' | 'set', options: Record<string, unknown>): string {
+  const payload = JSON.stringify({ operation, ...options });
+  return `
+local HttpService = game:GetService("HttpService")
+local simulator = game:GetService("StudioDeviceSimulatorService")
+local opts = HttpService:JSONDecode(${JSON.stringify(payload)})
+
+local function plain(value)
+\tlocal valueType = typeof(value)
+\tif valueType == "Vector2" then
+\t\treturn { x = value.X, y = value.Y, width = value.X, height = value.Y }
+\tend
+\tif valueType == "EnumItem" then
+\t\treturn value.Name
+\tend
+\tif type(value) == "table" then
+\t\tlocal out = {}
+\t\tfor k, v in pairs(value) do
+\t\t\tout[tostring(k)] = plain(v)
+\t\tend
+\t\treturn out
+\tend
+\treturn value
+end
+
+local function getDeviceInfo(deviceId)
+\tlocal ok, info = pcall(function()
+\t\treturn simulator:GetDeviceInfoAsync(deviceId)
+\tend)
+\tif ok then
+\t\treturn plain(info), nil
+\tend
+\treturn nil, tostring(info)
+end
+
+local function normalizeDeviceList(rawList)
+\tlocal devices = {}
+\tlocal ids = {}
+\tfor _, entry in ipairs(rawList) do
+\t\tlocal item
+\t\tlocal id
+\t\tif type(entry) == "table" then
+\t\t\titem = plain(entry)
+\t\t\tid = item.DeviceId or item.deviceId or item.Id or item.id or item[1]
+\t\telse
+\t\t\tid = tostring(entry)
+\t\t\titem = { DeviceId = id }
+\t\tend
+\t\tif id ~= nil then
+\t\t\tid = tostring(id)
+\t\t\tlocal info = getDeviceInfo(id)
+\t\t\tif type(info) == "table" then
+\t\t\t\titem = info
+\t\t\t\tif item.DeviceId == nil then item.DeviceId = id end
+\t\t\tend
+\t\t\tif item.IsCustom ~= true then
+\t\t\t\tids[id] = true
+\t\t\t\ttable.insert(devices, item)
+\t\t\tend
+\t\tend
+\tend
+\treturn devices, ids
+end
+
+local function getDeviceList()
+\tlocal rawList = simulator:GetDeviceListAsync()
+\treturn normalizeDeviceList(rawList)
+end
+
+local function assertBuiltInDeviceExists(deviceId)
+\tlocal _, ids = getDeviceList()
+\tif ids[deviceId] then return end
+\tlocal available = {}
+\tfor id in pairs(ids) do table.insert(available, id) end
+\ttable.sort(available)
+\terror('deviceId "' .. tostring(deviceId) .. '" is not an available built-in device. Use get_device_simulator_state to list supported device IDs. Available: ' .. table.concat(available, ", "), 0)
+end
+
+local function enumByName(enumType, raw, label)
+\tlocal name = tostring(raw)
+\tname = string.match(name, "([^%.]+)$") or name
+\tlocal available = {}
+\tfor _, item in ipairs(enumType:GetEnumItems()) do
+\t\ttable.insert(available, item.Name)
+\t\tif item.Name == name then
+\t\t\treturn item, item.Name
+\t\tend
+\tend
+\terror(label .. ' "' .. tostring(raw) .. '" is not valid. Available: ' .. table.concat(available, ", "), 0)
+end
+
+local function tryActiveGetter(state, key, fn)
+\tlocal ok, value = pcall(fn)
+\tif ok then
+\t\tstate[key] = plain(value)
+\telse
+\t\tstate.unavailable = state.unavailable or {}
+\t\tstate.unavailable[key] = tostring(value)
+\tend
+end
+
+local function readState(includeDeviceList, requestedDeviceId)
+\tlocal activeDeviceId = tostring(simulator:GetDeviceAsync())
+\tlocal state = {
+\t\tactiveDeviceId = activeDeviceId,
+\t\tisSimulating = activeDeviceId ~= "default",
+\t}
+
+\tif includeDeviceList then
+\t\tlocal devices = getDeviceList()
+\t\tstate.devices = devices
+\tend
+
+\tif requestedDeviceId ~= nil then
+\t\tassertBuiltInDeviceExists(requestedDeviceId)
+\t\tstate.deviceInfo = plain(simulator:GetDeviceInfoAsync(requestedDeviceId))
+\tend
+
+\tif state.isSimulating then
+\t\ttryActiveGetter(state, "resolution", function() return simulator:GetResolutionAsync() end)
+\t\ttryActiveGetter(state, "pixelDensity", function() return simulator:GetPixelDensityAsync() end)
+\t\ttryActiveGetter(state, "orientation", function() return simulator:GetOrientationAsync() end)
+\t\ttryActiveGetter(state, "scalingMode", function() return simulator:GetScalingModeAsync() end)
+\tend
+
+\treturn state
+end
+
+local function applySettings(settings)
+\tlocal applied = {}
+\tif settings.deviceId ~= nil then
+\t\tassertBuiltInDeviceExists(settings.deviceId)
+\t\tsimulator:SetDeviceAsync(settings.deviceId)
+\t\tapplied.deviceId = settings.deviceId
+\tend
+\tif settings.orientation ~= nil then
+\t\tlocal item, name = enumByName(Enum.ScreenOrientation, settings.orientation, "orientation")
+\t\tsimulator:SetOrientationAsync(item)
+\t\tapplied.orientation = name
+\tend
+\tif settings.resolution ~= nil then
+\t\tsimulator:SetResolutionAsync(settings.resolution.width, settings.resolution.height)
+\t\tapplied.resolution = { width = settings.resolution.width, height = settings.resolution.height }
+\tend
+\tif settings.pixelDensity ~= nil then
+\t\tsimulator:SetPixelDensityAsync(settings.pixelDensity)
+\t\tapplied.pixelDensity = settings.pixelDensity
+\tend
+\tif settings.scalingMode ~= nil then
+\t\tlocal item, name = enumByName(Enum.DeviceSimulatorScalingMode, settings.scalingMode, "scalingMode")
+\t\tsimulator:SetScalingModeAsync(item)
+\t\tapplied.scalingMode = name
+\tend
+\treturn applied
+end
+
+if opts.operation == "get" then
+\treturn readState(opts.includeDeviceList ~= false, opts.deviceId)
+end
+
+if opts.operation == "set" then
+\tlocal before = readState(false, nil)
+\tlocal applied
+\tif opts.stopSimulation == true then
+\t\tsimulator:StopSimulationAsync()
+\t\tapplied = { stopSimulation = true }
+\telse
+\t\tapplied = applySettings(opts.settings or {})
+\tend
+\treturn {
+\t\tsuccess = true,
+\t\tapplied = applied,
+\t\tbefore = before,
+\t\tafter = readState(false, nil),
+\t}
+end
+
+error("Unsupported device simulator operation: " .. tostring(opts.operation), 0)
+`.trim();
+}
+
+const isClientRole = (role: string): boolean => /^client-\d+$/.test(role);
+const isRuntimeRole = (role: string): boolean => role === 'server' || isClientRole(role);
+// Matches the plugin broker's BRIDGE_STALE_SECONDS: ten missed heartbeats.
+const CLIENT_BRIDGE_STALE_MS = 10_000;
+const anyRole = (): boolean => true;
+// Targets that address a whole scope rather than one Peer.
+const SCOPE_WIDE_TARGETS: ReadonlySet<string> = new Set(['all', 'all-clients', 'edit-and-clients']);
+
+/** A tool's target before an instance_id that names one Peer is applied. */
+interface TargetChoice {
+  requested: string | undefined;
+  fallback: string;
+  /** Roles the tool can act on; an instance_id naming another role only selects the scope. */
+  accepts: (role: string) => boolean;
+}
+
+export class RobloxStudioTools {
+  private client: StudioHttpClient;
+  private bridge: BridgeService;
+  private openCloudClient: OpenCloudClient;
+  private cookieClient: RobloxCookieClient;
+  private instanceManager: StudioInstanceManager;
+  private managedConnectionAssociations: Promise<void> = Promise.resolve();
+  private unsubscribePeerRegistered: () => void;
+  private hostWindowCapture: HostWindowCaptureFn = captureStudioWindow;
+  private hostViewportRects = new Map<string, HostViewportRectCacheEntry>();
+  private viewportCaptureQueues = new Map<string, Promise<void>>();
+  // Linux: the Studio process behind each Instance. Registry lookups expire; a
+  // process found through its window does not.
+  private hostCaptureProcessIds = new Map<string, { processId?: number; cachedAt: number; discovered?: boolean }>();
+  // capture_video: the host recorder and the recordings started per Instance.
+  private videoRecorder: VideoRecorderBackend = createFfmpegVideoBackend();
+  private videoRecordings = new Map<string, ActiveVideoRecording>();
+  private videoStarting = new Set<string>();
+  // How long start waits for the encoder to fail fast before reporting success.
+  private videoStartGraceMs = VIDEO_START_GRACE_MS;
+  // generate_model reference images, shared by retries under one operation ID.
+  private readonly referenceUploads = new ReferenceUploads();
+  // Paces chunks of a client capture copied through the client broker.
+  private captureChunkPace: PaceCaptureChunk = idleAsLongAsRead;
+  // Long calls that outlived the response budget, by request id.
+  private readonly toolJobs = new Map<string, ToolJob>();
+
+  constructor(bridge: BridgeService) {
+    this.client = new StudioHttpClient(bridge);
+    this.bridge = bridge;
+    this.openCloudClient = new OpenCloudClient();
+    this.cookieClient = new RobloxCookieClient();
+    this.instanceManager = new StudioInstanceManager();
+    this.unsubscribePeerRegistered = this.bridge.onPeerRegistered((peer) => {
+      const instanceManager = this.instanceManager;
+      const association = this.managedConnectionAssociations.then(() =>
+        this._associateManagedEditConnection(peer, instanceManager),
+      );
+      this.managedConnectionAssociations = association.catch((error) => {
+        console.warn(
+          `[robloxstudio-mcp] managed Studio connection association failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    });
+  }
+
+  getStudioLifecycleCapabilities() {
+    return this.instanceManager.getLifecycleCapabilities();
+  }
+
+  async dispose(): Promise<void> {
+    this.unsubscribePeerRegistered();
+    await this.managedConnectionAssociations;
+  }
+
+  private _textResult(body: Record<string, unknown>) {
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  }
+
+  // Runs `run` but answers within the response budget. A call still running then
+  // returns a pending request id; an identical call (same key) while it runs
+  // joins it instead of starting the work again.
+  private async _withinResponseBudget(
+    tool: string,
+    action: string,
+    args: unknown[],
+    run: () => Promise<ToolCallResult>,
+  ): Promise<ToolCallResult> {
+    const now = Date.now();
+    for (const [id, job] of this.toolJobs) {
+      if (job.settledAt !== undefined && now - job.settledAt > TOOL_JOB_RETENTION_MS) this.toolJobs.delete(id);
+    }
+    const key = JSON.stringify([tool, action, ...args]);
+    let job = [...this.toolJobs.values()].find((candidate) => candidate.key === key && candidate.outcome === undefined);
+    const joined = job !== undefined;
+    if (!job) {
+      const created: ToolJob = { id: `${tool}-${randomUUID()}`, key, tool, action, startedAt: now, done: Promise.resolve() };
+      created.done = run().then(
+        (result) => { created.outcome = { result }; },
+        (error: unknown) => { created.outcome = { error }; },
+      ).finally(() => { created.settledAt = Date.now(); });
+      this.toolJobs.set(created.id, created);
+      job = created;
+    }
+    const outcome = await this._awaitToolJob(job, responseBudgetMs());
+    if (!outcome) return this._textResult({ ...this._toolJobPending(job), ...(joined ? { joinedRunningCall: true } : {}) });
+    // A result delivered within the budget is not kept; a joined caller leaves it for the first.
+    if (!joined) this.toolJobs.delete(job.id);
+    if ('error' in outcome) throw outcome.error;
+    return outcome.result;
+  }
+
+  private async _awaitToolJob(job: ToolJob, waitMs: number, signal?: AbortSignal): Promise<ToolJobOutcome | undefined> {
+    if (job.outcome || waitMs <= 0 || signal?.aborted) return job.outcome;
+    const timer = Promise.withResolvers<void>();
+    const handle = setTimeout(timer.resolve, waitMs);
+    const abort = () => timer.resolve();
+    signal?.addEventListener('abort', abort, { once: true });
+    try {
+      await Promise.race([job.done, timer.promise]);
+    } finally {
+      clearTimeout(handle);
+      signal?.removeEventListener('abort', abort);
+    }
+    return job.outcome;
+  }
+
+  private _toolJobPending(job: ToolJob): Record<string, unknown> {
+    return {
+      requestId: job.id,
+      state: 'pending',
+      outcome: 'pending',
+      tool: job.tool,
+      action: job.action,
+      elapsedMs: Date.now() - job.startedAt,
+      // get_request_status rejects wait_ms above MAX_OPERATION_WAIT_MS, so never suggest more.
+      next: `Still running. Call get_request_status with request_id="${job.id}" and wait_ms up to ${Math.min(responseBudgetMs(), MAX_OPERATION_WAIT_MS)} to collect the result. Do not repeat the ${job.tool} call.`,
+    };
+  }
+
+  async getRobloxSkills(action: string, name?: string) {
+    if (action !== 'list' && action !== 'get') {
+      throw new Error('get_roblox_skills action must be "list" or "get"');
+    }
+
+    const bundle = loadBuiltInStudioSkills();
+    const bundleMetadata = {
+      source: 'installed-studio-assistant',
+      studioVersion: bundle.studioVersion,
+      bundlePath: bundle.bundlePath,
+      bundleModifiedAt: bundle.bundleModifiedAt,
+      bundleSha256: bundle.bundleSha256,
+    };
+
+    if (action === 'list') {
+      return this._textResult({
+        action,
+        ...bundleMetadata,
+        count: bundle.skills.length,
+        skills: bundle.skills.map((skill) => ({
+          name: skill.name,
+          sourceName: skill.sourceName,
+          description: skill.description,
+          document: skill.document,
+          hasCombinedDocument: skill.hasCombinedDocument,
+          contentLength: skill.contentLength,
+          contentSha256: skill.contentSha256,
+        })),
+      });
+    }
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      throw new Error('get_roblox_skills action="get" requires a skill name from action="list"');
+    }
+    const skill = findBuiltInStudioSkill(bundle, name);
+    if (!skill) {
+      throw new Error(
+        `Built-in Studio skill "${name}" was not found. Available skills: ` +
+        bundle.skills.map((candidate) => candidate.name).join(', '),
+      );
+    }
+    return this._textResult({
+      action,
+      ...bundleMetadata,
+      skill,
+    });
+  }
+
+  async getRobloxDocs(name: string, docType?: string, section?: string) {
+    if (!name || typeof name !== 'string') {
+      throw new Error('get_roblox_docs requires a name (e.g. "ProximityPrompt")');
+    }
+    const category = docType ?? 'classes';
+    if (!isDocCategory(category)) {
+      throw new Error(`Invalid doc_type "${category}". Valid categories: ${DOC_CATEGORIES.join(', ')}`);
+    }
+    const result = await getRobloxDoc(category, name.trim(), section);
+    return { content: [{ type: 'text', text: result.content }] };
+  }
+
+  private _parseTextResult(result: unknown): Record<string, unknown> {
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      !('content' in result) ||
+      !Array.isArray(result.content)
+    ) {
+      return {};
+    }
+    const first = result.content[0];
+    if (first === null || typeof first !== 'object' || !('text' in first) || typeof first.text !== 'string') {
+      return {};
+    }
+    try {
+      const parsed: unknown = JSON.parse(first.text);
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? { ...parsed } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private _briefRoles(instanceId: string): { roles: string[]; runtimeRoles: string[] } {
+    const roles = this._rolesForScope(instanceId);
+    return {
+      roles,
+      runtimeRoles: roles.filter((role) => role === 'server' || /^client-\d+$/.test(role)),
+    };
+  }
+
+  private _routingErrorData() {
+    const instances = this.bridge.getConnectedInstances();
+    const multiplayerGroups = this.bridge.getConnectedMultiplayerGroups();
+    return {
+      instances,
+      multiplayerGroups,
+      count: instances.length + multiplayerGroups.length,
+    };
+  }
+
+  private _peerForRoleInScope(instanceId: string, role: string) {
+    return this.bridge.getPeersInScope(instanceId).find((peer) => peer.role === role);
+  }
+
+  // Forwards exactly the arguments given, so optional recovery fields stay absent.
+  private _requestPeer(...args: Parameters<StudioHttpClient['request']>): Promise<StudioToolResponse> {
+    return this.client.request(...args) as Promise<StudioToolResponse>;
+  }
+
+  private async _request(
+    endpoint: string,
+    data: unknown,
+    instanceId: string,
+    role: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ) {
+    const refresh = this.bridge.refreshTopologyForRouting(signal);
+    if (refresh) await refresh;
+    const peer = this._peerForRoleInScope(instanceId, role);
+    if (!peer) {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: `Routing scope for instance "${instanceId}" has no role "${role}".`,
+        data: this._routingErrorData(),
+      });
+    }
+    return this._requestPeer(endpoint, data, peer.peerId, timeoutMs, signal);
+  }
+
+  // Resolve an optional Studio process plus role to one exact Peer and dispatch.
+  private async _callSingle(
+    endpoint: string,
+    data: unknown,
+    target: string | TargetChoice | undefined,
+    instance_id: string | undefined,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    operationId?: string,
+  ): Promise<StudioToolResponse> {
+    return this._withSinglePeer(target, instance_id, signal, (targetPeerId) =>
+      this._requestPeer(endpoint, data, targetPeerId, timeoutMs, signal, operationId));
+  }
+
+  // Dispatch runs in the same turn as resolution, so a known topology queues at once.
+  private async _withSinglePeer<T>(
+    target: string | TargetChoice | undefined,
+    instance_id: string | undefined,
+    signal: AbortSignal | undefined,
+    dispatch: (targetPeerId: string, targetInstanceId: string) => Promise<T>,
+  ): Promise<T> {
+    const refresh = this.bridge.refreshTopologyForRouting(signal);
+    if (refresh) await refresh;
+    const role = typeof target === 'object' ? this._targetForInstanceId(instance_id, target) : target;
+    const resolved = this.bridge.resolveTarget({ instance_id, target: role });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: 'This tool does not support target=all. Pick a specific role or omit target.',
+        data: this._routingErrorData(),
+      });
+    }
+    return dispatch(resolved.targetPeerId, resolved.targetInstanceId);
+  }
+
+  // A grouped runtime process ID, or its role-suffixed Instance ID, names exactly
+  // one Peer. Solo playtest Peers share one Instance ID, so it names none of them.
+  private _peerSelectedByInstanceId(instance_id: string | undefined): StudioPeer | undefined {
+    if (instance_id === undefined) return undefined;
+    const selected = this.bridge.getPeersInScope(instance_id).filter((peer) =>
+      isRuntimeRole(peer.role) &&
+      (instance_id === peer.instanceId || instance_id === `${peer.instanceId}-${peer.role}`));
+    return selected.length === 1 ? selected[0] : undefined;
+  }
+
+  // Apply a Peer-naming instance_id to a tool's target after topology refresh: it
+  // replaces the tool default, and a different single-Peer target is rejected
+  // instead of silently acting on another Peer.
+  private _targetForInstanceId(instance_id: string | undefined, choice: TargetChoice): string {
+    const requested = choice.requested || undefined;
+    const selected = this._peerSelectedByInstanceId(instance_id);
+    if (!selected || instance_id === undefined || !choice.accepts(selected.role)) return requested ?? choice.fallback;
+    if (requested === undefined) return selected.role;
+    if (requested !== selected.role && !SCOPE_WIDE_TARGETS.has(requested)) {
+      // A playtest Peer that left (a client whose connection dropped) can leave
+      // one runtime Peer that the Instance ID then appears to select. The real
+      // problem is the missing role, not an ambiguous target.
+      const roles = this.bridge.getPeersInScope(instance_id).map((peer) => peer.role);
+      if (!roles.includes(requested)) {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: `instance_id "${instance_id}" has no ${requested} Peer; connected roles: ${roles.join(', ') || 'none'}. A playtest client that disconnected does not return; restart the playtest to get it back.`,
+          data: this._routingErrorData(),
+        });
+      }
+      throw new RoutingFailure({
+        code: 'ambiguous_target',
+        message: `instance_id "${instance_id}" selects ${selected.role}, but target=${requested}. Omit target, pass target=${selected.role}, or pass the controller Instance ID with target=${requested}.`,
+        data: this._routingErrorData(),
+      });
+    }
+    return requested;
+  }
+
+  // Honor an explicitly selected client for viewport/input operations; otherwise
+  // prefer the first client in the scope, then retain the default Peer's Instance.
+  private _resolveRuntime(instance_id?: string): { instanceId: string; clientRole?: string } {
+    const resolved = this.bridge.resolveTarget({ instance_id, target: undefined });
+    let scopePeers: StudioPeer[];
+    let defaultInstanceId: string | undefined;
+    if (resolved.ok) {
+      if (resolved.mode !== 'single') {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: 'A single runtime target is required.',
+          data: this._routingErrorData(),
+        });
+      }
+      scopePeers = this.bridge.getPeersInScope(resolved.targetInstanceId);
+      defaultInstanceId = resolved.targetInstanceId;
+    } else if (resolved.error.code === 'target_role_required') {
+      // Without an edit Peer (for example, during some solo playtests), generic
+      // routing cannot pick a default role, but a client viewport is still valid.
+      // resolveTarget already confirmed exactly one scope when instance_id is omitted.
+      scopePeers = instance_id !== undefined ? this.bridge.getPeersInScope(instance_id) : this.bridge.getPeers();
+    } else {
+      throw new RoutingFailure(resolved.error);
+    }
+    const named = this._peerSelectedByInstanceId(instance_id);
+    const client = (named && isClientRole(named.role) ? named : undefined) ?? scopePeers
+      .filter((peer) => isClientRole(peer.role))
+      .sort((a, b) => a.role.localeCompare(b.role) || a.peerId.localeCompare(b.peerId))[0];
+    if (client) return { instanceId: client.instanceId, clientRole: client.role };
+    if (defaultInstanceId === undefined) {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: `No edit or client viewport is connected in this scope. Connected roles: ${scopePeers.map((peer) => peer.role).join(', ')}.`,
+        data: this._routingErrorData(),
+      });
+    }
+    return { instanceId: defaultInstanceId };
+  }
+
+  // Resolve synchronously after the caller has refreshed and captured its topology.
+  private _resolveInstanceIdOnly(instance_id?: string): string {
+    if (instance_id !== undefined) {
+      const resolvedInstanceId = this.bridge.resolveConnectedInstanceId(instance_id);
+      if (resolvedInstanceId === undefined) {
+        throw new RoutingFailure({
+          code: 'unrecognized_instance_id',
+          message: `instance_id "${instance_id}" is not connected. Pass a connected top-level or grouped role-suffixed Instance ID.`,
+          data: this._routingErrorData(),
+        });
+      }
+      return resolvedInstanceId;
+    }
+
+    const resolved = this.bridge.resolveTarget({ target: undefined });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'multiple_instances_connected',
+        message: 'Multiple Studio process scopes are connected. Pass instance_id to disambiguate.',
+        data: this._routingErrorData(),
+      });
+    }
+    return resolved.targetInstanceId;
+  }
+
+  private _resolveSingleTarget(
+    target: string,
+    instance_id?: string,
+  ): { targetPeerId: string; instanceId: string; role: string } {
+    const resolved = this.bridge.resolveTarget({ instance_id, target });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: 'Pick a specific target role for this tool.',
+        data: this._routingErrorData(),
+      });
+    }
+    return {
+      targetPeerId: resolved.targetPeerId,
+      instanceId: resolved.targetInstanceId,
+      role: resolved.targetRole,
+    };
+  }
+
+
+  private _rolesForScope(instanceId: string): string[] {
+    return this.bridge.getPeersInScope(instanceId).map((peer) => peer.role);
+  }
+
+
+  private _clientRolesForScope(instanceId: string): string[] {
+    return this._rolesForScope(instanceId)
+      .filter((role) => /^client-\d+$/.test(role))
+      .sort((a, b) => Number(a.slice('client-'.length)) - Number(b.slice('client-'.length)));
+  }
+
+  private _runtimeTargetsForScope(
+    instanceId: string,
+  ): { targetPeerId: string; instanceId: string; role: string }[] {
+    return this.bridge.getPeersInScope(instanceId)
+      .filter((peer) => peer.role === 'server' || /^client-\d+$/.test(peer.role))
+      .map((peer) => ({
+        targetPeerId: peer.peerId,
+        instanceId: peer.instanceId,
+        role: peer.role,
+      }));
+  }
+
+  private _compactSimulationResetResult(result: Record<string, unknown>): Record<string, unknown> {
+    const compact: Record<string, unknown> = {};
+    if ('network' in result) compact.network = true;
+    if ('deviceSimulator' in result) compact.deviceSimulator = true;
+    if (result.errors !== undefined) compact.errors = result.errors;
+    return compact;
+  }
+
+  private _resolveDeviceSimulatorSingleTarget(
+    target: string | undefined,
+    instance_id: string | undefined,
+    toolName: string,
+  ): { instanceId: string; role: string; selectedTarget: string } {
+    const selectedTarget = this._targetForInstanceId(instance_id, { requested: target, fallback: 'edit', accepts: isClientRole });
+    if (selectedTarget === 'server' || selectedTarget === 'all' || selectedTarget === 'all-clients') {
+      throw new Error(`${toolName} target must be "edit" or "client-N" (got: ${selectedTarget})`);
+    }
+    if (selectedTarget !== 'edit' && !/^client-\d+$/.test(selectedTarget)) {
+      throw new Error(`${toolName} target must be "edit" or "client-N" (got: ${selectedTarget})`);
+    }
+    const resolved = this._resolveSingleTarget(selectedTarget, instance_id);
+    return { ...resolved, selectedTarget };
+  }
+
+  private _resolveDeviceSimulatorSetTargets(
+    target: string | undefined,
+    instance_id: string | undefined,
+  ): { instanceId: string; selectedTarget: string; roles: string[] } {
+    const selectedTarget = this._targetForInstanceId(instance_id, { requested: target, fallback: 'edit', accepts: isClientRole });
+    if (selectedTarget === 'all-clients') {
+      const instanceId = this._resolveInstanceIdOnly(instance_id);
+      const roles = this._clientRolesForScope(instanceId);
+      if (roles.length === 0) {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: `instance "${instanceId}" has no connected playtest client roles. Start a playtest first.`,
+          data: this._routingErrorData(),
+        });
+      }
+      return { instanceId, selectedTarget, roles };
+    }
+
+    const resolved = this._resolveDeviceSimulatorSingleTarget(selectedTarget, instance_id, 'set_device_simulator');
+    return { instanceId: resolved.instanceId, selectedTarget, roles: [resolved.role] };
+  }
+
+  private _normalizeSimulationInclude(include: string | undefined): SimulationInclude {
+    const selectedInclude = include ?? 'both';
+    if (selectedInclude !== 'network' && selectedInclude !== 'deviceSimulator' && selectedInclude !== 'both') {
+      throw new Error(`get_simulation_state include must be "network", "deviceSimulator", or "both" (got: ${selectedInclude})`);
+    }
+    return selectedInclude;
+  }
+
+  private _resolveSimulationTargets(
+    target: string | undefined,
+    instance_id: string | undefined,
+    toolName: string,
+  ): { instanceId: string; selectedTarget: string; roles: string[]; warnings: string[] } {
+    const selectedTarget = this._targetForInstanceId(instance_id, { requested: target, fallback: 'edit-and-clients', accepts: isClientRole });
+    if (selectedTarget === 'server' || selectedTarget === 'all') {
+      throw new Error(`${toolName} target must be "edit", "client-N", "all-clients", or "edit-and-clients" (got: ${selectedTarget})`);
+    }
+
+    const instanceId = this._resolveInstanceIdOnly(instance_id);
+    const connectedRoles = this._rolesForScope(instanceId);
+    const clientRoles = this._clientRolesForScope(instanceId);
+    const warnings: string[] = [];
+    let roles: string[];
+
+    if (selectedTarget === 'edit') {
+      if (!connectedRoles.includes('edit')) {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: `instance "${instanceId}" has no role "edit". Available roles: ${connectedRoles.join(', ') || 'none'}.`,
+          data: this._routingErrorData(),
+        });
+      }
+      roles = ['edit'];
+    } else if (selectedTarget === 'all-clients') {
+      roles = clientRoles;
+      if (roles.length === 0) {
+        warnings.push(`No connected playtest client roles found for instance "${instanceId}".`);
+      }
+    } else if (selectedTarget === 'edit-and-clients') {
+      roles = [];
+      if (connectedRoles.includes('edit')) {
+        roles.push('edit');
+      } else {
+        warnings.push(`No edit role found for instance "${instanceId}".`);
+      }
+      roles.push(...clientRoles);
+    } else if (/^client-\d+$/.test(selectedTarget)) {
+      if (!clientRoles.includes(selectedTarget)) {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: `instance "${instanceId}" has no role "${selectedTarget}". Available client roles: ${clientRoles.join(', ') || 'none'}.`,
+          data: this._routingErrorData(),
+        });
+      }
+      roles = [selectedTarget];
+    } else {
+      throw new Error(`${toolName} target must be "edit", "client-N", "all-clients", or "edit-and-clients" (got: ${selectedTarget})`);
+    }
+
+    return { instanceId, selectedTarget, roles, warnings };
+  }
+
+  private _parseExecuteLuauJsonResponse(response: unknown, toolName: string): unknown {
+    const r = response as { success?: boolean; error?: string; message?: string; returnValue?: unknown };
+    if (r?.success === false) {
+      throw new Error(r.error || r.message || `${toolName} Luau execution failed`);
+    }
+    if (typeof r?.returnValue !== 'string') {
+      return response;
+    }
+    if (r.returnValue === '') {
+      return {};
+    }
+    try {
+      return JSON.parse(r.returnValue);
+    } catch {
+      throw new Error(`${toolName} returned non-JSON data: ${r.returnValue}`);
+    }
+  }
+
+  // A primary of this version serves simulation reads natively; an older one
+  // only through generated Luau, which a restricted /proxy refuses.
+  private _supportsSimulationReads(): boolean {
+    return this.bridge.supportsPrimaryFeature('simulation_reads');
+  }
+
+  private _parseSimulationReadResponse(response: unknown, label: string): unknown {
+    const record = asRecord(response);
+    if (!record) throw new StudioOperationError(`${label} returned an invalid response`, 'invalid_response');
+    const { success, error, message, ...details } = record;
+    if (success === false) {
+      const code = typeof error === 'string' && error !== '' ? error : 'read_failed';
+      throw new StudioOperationError(typeof message === 'string' && message !== '' ? message : `${label} failed: ${code}`, code, details);
+    }
+    if (typeof error === 'string') throw new StudioOperationError(error, 'studio_error');
+    return response;
+  }
+
+  private async _executeNetworkStateOperation(
+    instanceId: string,
+    role: string,
+    operation: 'get' | 'reset',
+  ): Promise<unknown> {
+    if (operation === 'get' && this._supportsSimulationReads()) {
+      const response = await this._request('/api/get-network-simulation-state', {}, instanceId, role);
+      return this._parseSimulationReadResponse(response, 'network simulation get');
+    }
+    const code = buildNetworkStateLuau(operation);
+    const response = await this._request('/api/execute-luau', { code }, instanceId, role);
+    return this._parseExecuteLuauJsonResponse(response, `network simulation ${operation}`);
+  }
+
+  private async _executeDeviceSimulatorOperation(
+    instanceId: string,
+    role: string,
+    operation: 'get' | 'set',
+    options: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (operation === 'get' && this._supportsSimulationReads()) {
+      const data: Record<string, unknown> = { includeDeviceList: options.includeDeviceList !== false };
+      if (options.deviceId !== undefined) data.deviceId = options.deviceId;
+      const response = await this._request('/api/get-device-simulator-state', data, instanceId, role);
+      return this._parseSimulationReadResponse(response, 'device simulator get');
+    }
+    const code = buildDeviceSimulatorLuau(operation, options);
+    const response = await this._request('/api/execute-luau', { code }, instanceId, role);
+    return this._parseExecuteLuauJsonResponse(response, `device simulator ${operation}`);
+  }
+
+  private _settingsFromDeviceSimulatorState(state: unknown): DeviceSimulatorSettings | { stopSimulation: true } {
+    const s = state as {
+      isSimulating?: boolean;
+      activeDeviceId?: unknown;
+      orientation?: unknown;
+      resolution?: unknown;
+      pixelDensity?: unknown;
+      scalingMode?: unknown;
+    };
+    if (!s || s.isSimulating !== true || typeof s.activeDeviceId !== 'string' || s.activeDeviceId === 'default') {
+      return { stopSimulation: true };
+    }
+    return normalizeDeviceSimulatorSettings({
+      deviceId: s.activeDeviceId,
+      orientation: s.orientation,
+      resolution: s.resolution,
+      pixelDensity: s.pixelDensity,
+      scalingMode: s.scalingMode,
+    });
+  }
+
+  private _deviceSimulatorStateWithoutDeviceList(state: unknown): unknown {
+    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+      return state;
+    }
+    const rest = { ...(state as Record<string, unknown>) };
+    delete rest.devices;
+    return rest;
+  }
+
+  private _assertCanRestoreDeviceSimulatorState(state: unknown): void {
+    const s = state as {
+      isSimulating?: boolean;
+      activeDeviceId?: unknown;
+      devices?: unknown;
+    };
+    if (!s || s.isSimulating !== true || typeof s.activeDeviceId !== 'string' || s.activeDeviceId === 'default') {
+      return;
+    }
+    const devices = Array.isArray(s.devices) ? s.devices : [];
+    const isBuiltIn = devices.some((entry) => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return false;
+      const device = entry as { DeviceId?: unknown; deviceId?: unknown; Id?: unknown; id?: unknown; IsCustom?: unknown };
+      const id = device.DeviceId ?? device.deviceId ?? device.Id ?? device.id;
+      return id === s.activeDeviceId && device.IsCustom !== true;
+    });
+    if (!isBuiltIn) {
+      throw new Error(
+        `capture_device_matrix cannot safely restore active custom device "${s.activeDeviceId}". ` +
+        'Switch the simulator to default or a built-in preset first, or pass restoreAfter=false only if you intentionally accept changing the simulator state.',
+      );
+    }
+  }
+
+  private async _waitForRuntimeRoles(
+    instanceId: string,
+    opts: { server?: boolean; clientCount?: number; absentRole?: string; noRuntime?: boolean },
+    timeoutSec = 30,
+  ): Promise<{ ok: boolean; roles: string[]; timedOut: boolean }> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    while (Date.now() < deadline) {
+      const refresh = this.bridge.refreshTopologyForRouting();
+      if (refresh) await refresh;
+      const roles = this._rolesForScope(instanceId);
+      const clientRoles = this._clientRolesForScope(instanceId);
+      const hasServer = !opts.server || roles.includes('server');
+      const hasClients = opts.clientCount === undefined || clientRoles.length >= opts.clientCount;
+      const absent = opts.absentRole === undefined || !roles.includes(opts.absentRole);
+      const runtimeAbsent = !opts.noRuntime || !roles.some((role) => role === 'server' || /^client-\d+$/.test(role));
+      if (hasServer && hasClients && absent && runtimeAbsent) {
+        return { ok: true, roles, timedOut: false };
+      }
+      await sleep(250);
+    }
+    return {
+      ok: false,
+      roles: this._rolesForScope(instanceId),
+      timedOut: true,
+    };
+  }
+
+  private async _waitForExactClientCount(
+    instanceId: string,
+    expectedClientCount: number,
+    timeoutSec = 30,
+    stableMs = 3000,
+  ): Promise<{ ok: boolean; roles: string[]; timedOut: boolean; extraClients: boolean; clientCount: number }> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    let exactSince: number | undefined;
+
+    while (Date.now() < deadline) {
+      const refresh = this.bridge.refreshTopologyForRouting();
+      if (refresh) await refresh;
+      const roles = this._rolesForScope(instanceId);
+      const clientCount = this._clientRolesForScope(instanceId).length;
+      if (clientCount > expectedClientCount) {
+        return { ok: false, roles, timedOut: false, extraClients: true, clientCount };
+      }
+      if (roles.includes('server') && clientCount === expectedClientCount) {
+        exactSince ??= Date.now();
+        if (Date.now() - exactSince >= stableMs) {
+          return { ok: true, roles, timedOut: false, extraClients: false, clientCount };
+        }
+      } else {
+        exactSince = undefined;
+      }
+      await sleep(250);
+    }
+
+    const roles = this._rolesForScope(instanceId);
+    const clientCount = this._clientRolesForScope(instanceId).length;
+    return { ok: false, roles, timedOut: true, extraClients: clientCount > expectedClientCount, clientCount };
+  }
+
+  private async _waitForRuntimeRolesFresh(
+    instanceId: string,
+    connectedAfter: number,
+    requiredRoles: string[],
+    timeoutSec = 60,
+    soloStart?: { editPeerId: string; testId: string },
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; roles: string[]; timedOut: boolean; studioError?: string }> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    while (Date.now() < deadline) {
+      const refresh = this.bridge.refreshTopologyForRouting(signal);
+      if (refresh) await refresh;
+      const peers = this.bridge.getPeersInScope(instanceId);
+      const roles = peers.map((peer) => peer.role);
+      const freshRoles = new Set(
+        peers
+          .filter((peer) => peer.connectedAt >= connectedAfter)
+          .map((peer) => peer.role),
+      );
+      if (requiredRoles.every((role) => freshRoles.has(role))) {
+        return { ok: true, roles, timedOut: false };
+      }
+      if (soloStart) {
+        const studioError = await this._soloStartFailure(soloStart.editPeerId, soloStart.testId, deadline);
+        if (studioError !== undefined) {
+          return { ok: false, roles: this._rolesForScope(instanceId), timedOut: false, studioError };
+        }
+      }
+      await sleep(250, signal);
+    }
+    return {
+      ok: false,
+      roles: this._rolesForScope(instanceId),
+      timedOut: true,
+    };
+  }
+
+  // Studio's error when the edit plugin's Execute*Async call for this start failed.
+  private async _soloStartFailure(editPeerId: string, testId: string, deadline: number): Promise<string | undefined> {
+    try {
+      const remainingMs = Math.max(1, Math.min(1000, deadline - Date.now()));
+      const editState = await this._requestPeer('/api/multiplayer-test-state', {}, editPeerId, remainingMs);
+      const solo: unknown = editState?.soloSession;
+      if (solo === null || typeof solo !== 'object' || !('testId' in solo) || !('phase' in solo)) return undefined;
+      if (solo.testId !== testId || solo.phase !== 'failed') return undefined;
+      return 'error' in solo && typeof solo.error === 'string' ? solo.error : 'unknown error';
+    } catch {
+      // The edit peer may be busy while Studio starts the test; readiness decides.
+      return undefined;
+    }
+  }
+
+  // A registered runtime peer can still be loading; a trivial eval proves its
+  // DataModel runs code. Polls every runtime role until each answers, one leaves,
+  // or the deadline passes, then lists how to address each peer that answered.
+  private async _waitForRuntimeEval(instanceId: string, deadline: number, signal?: AbortSignal): Promise<RuntimeEvalReadiness> {
+    const pending = new Map(this._runtimeTargetsForScope(instanceId).map((peer) => [peer.role, 'not probed']));
+    const disconnected: string[] = [];
+    let firstPass = true;
+    probing: while (pending.size > 0) {
+      for (const role of [...pending.keys()]) {
+        // A playtest peer that left does not return, so polling it until the deadline is pointless.
+        const present = new Set(this._runtimeTargetsForScope(instanceId).map((peer) => peer.role));
+        disconnected.push(...[...pending.keys()].filter((pendingRole) => !present.has(pendingRole)));
+        if (disconnected.length > 0) {
+          for (const gone of disconnected) pending.set(gone, 'disconnected before answering an eval');
+          break probing;
+        }
+        // Every peer gets one probe of at least 1 s, so a start that detected its
+        // peers just before the deadline still reports a real error for each one.
+        // Later probes never start, nor run, past the deadline.
+        const remainingMs = deadline - Date.now();
+        if (!firstPass && remainingMs <= 0) break probing;
+        const timeoutMs = firstPass ? Math.max(1_000, Math.min(5_000, remainingMs)) : Math.min(5_000, remainingMs);
+        try {
+          const response = await this._request('/api/eval-runtime', { code: 'return true' }, instanceId, role, timeoutMs, signal);
+          if (response.ok === true) pending.delete(role);
+          else pending.set(role, String(response.error ?? 'eval did not succeed'));
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          pending.set(role, errorMessage(error));
+        }
+      }
+      firstPass = false;
+      if (pending.size === 0 || Date.now() >= deadline) break;
+      await sleep(250, signal);
+    }
+    // Solo runtime peers share the edit Instance ID and need target=<role>; grouped
+    // peers also answer to their role-suffixed ID. Passing both always works.
+    const grouped = this.bridge.getMultiplayerGroups().some((group) => group.instanceIds.includes(instanceId));
+    const peers = this._runtimeTargetsForScope(instanceId).filter((peer) => !pending.has(peer.role));
+    const targets = ['server', ...this._clientRolesForScope(instanceId)]
+      .flatMap((role) => peers.filter((peer) => peer.role === role))
+      .map((peer) => ({ role: peer.role, instance_id: grouped ? `${peer.instanceId}-${peer.role}` : peer.instanceId, target: peer.role }));
+    return {
+      ready: pending.size === 0,
+      targets,
+      notReady: [...pending].map(([role, error]) => ({ role, error })),
+      disconnected,
+    };
+  }
+
+  async getFileTree(path: string = '', instance_id?: string) {
+    const response = await this._callSingle('/api/file-tree', { path }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async searchFiles(query: string, searchType: string = 'name', instance_id?: string) {
+    const response = await this._callSingle('/api/search-files', { query, searchType }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+
+  async getPlaceInfo(instance_id?: string) {
+    const response = await this._callSingle('/api/place-info', {}, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async manageMonetization(request: Record<string, unknown>, instance_id?: string) {
+    return this._textResult(await runManageMonetization(request, {
+      client: this.openCloudClient,
+      connectedUniverseId: () => this._connectedUniverseId(instance_id),
+    }));
+  }
+
+  async manageExperience(request: Record<string, unknown>, instance_id?: string) {
+    return this._textResult(await runManageExperience(request, {
+      client: this.openCloudClient,
+      connectedUniverseId: () => this._connectedUniverseId(instance_id),
+    }));
+  }
+
+  // Open Cloud universe APIs address a universe, which Studio reports as game.GameId.
+  private async _connectedUniverseId(instance_id?: string): Promise<number> {
+    let info: StudioToolResponse;
+    try {
+      info = await this._callSingle('/api/place-info', {}, undefined, instance_id);
+    } catch (error) {
+      if (error instanceof RoutingFailure) {
+        throw new RoutingFailure({
+          ...error.routingError,
+          message: `${error.routingError.message} Pass universe_id to skip Studio.`,
+        });
+      }
+      throw error;
+    }
+    return typeof info.gameId === 'number' ? info.gameId : 0;
+  }
+
+  async searchObjects(query: string | undefined, options: {
+    searchType?: string;
+    propertyName?: string;
+    path?: string;
+    className?: string;
+    maxResults?: number;
+  } = {}, instance_id?: string) {
+    const response = await this._callSingle('/api/search-objects', {
+      query,
+      searchType: options.searchType ?? 'name',
+      propertyName: options.propertyName,
+      path: options.path,
+      className: options.className,
+      maxResults: options.maxResults,
+    }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+
+  async getInstanceProperties(instancePath: string, excludeSource?: boolean, instance_id?: string) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for get_instance_properties');
+    }
+    const response = await this._callSingle('/api/instance-properties', { instancePath, excludeSource }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async searchByProperty(propertyName: string, propertyValue: string, instance_id?: string) {
+    if (!propertyName || !propertyValue) {
+      throw new Error('Property name and value are required for search_by_property');
+    }
+    const response = await this._callSingle('/api/search-by-property', {
+      propertyName,
+      propertyValue
+    }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async getClassInfo(className: string, instance_id?: string) {
+    if (!className) {
+      throw new Error('Class name is required for get_class_info');
+    }
+    const response = await this._callSingle('/api/class-info', { className }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+
+  async getProjectStructure(path?: string, maxDepth?: number, scriptsOnly?: boolean, instance_id?: string) {
+    const response = await this._callSingle('/api/project-structure', {
+      path,
+      maxDepth,
+      scriptsOnly
+    }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async setProperties(
+    instancePath: string,
+    properties: Record<string, unknown>,
+    instance_id?: string,
+    operation_id?: string,
+    options: { atomic?: unknown; dryRun?: unknown } = {},
+  ) {
+    if (!instancePath || !properties) {
+      throw new Error('instancePath and properties are required for set_properties');
+    }
+    const { atomic, dryRun } = options;
+    if (atomic !== undefined && typeof atomic !== 'boolean') {
+      throw new Error('set_properties atomic must be a boolean');
+    }
+    if (dryRun !== undefined && typeof dryRun !== 'boolean') {
+      throw new Error('set_properties dryRun must be a boolean');
+    }
+    if (dryRun === true && atomic !== true) {
+      throw new Error('set_properties dryRun requires atomic: true');
+    }
+    // Omitted options keep the original payload, and with it the operation fingerprint.
+    const payload: Record<string, unknown> = { instancePath, properties };
+    if (atomic !== undefined) payload.atomic = atomic;
+    if (dryRun !== undefined) payload.dryRun = dryRun;
+    const response = await this._callSingle('/api/set-properties', payload, undefined, instance_id, undefined, undefined, operation_id);
+    return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+  }
+
+
+  async getScriptSource(instancePath: string, startLine?: number, endLine?: number, instance_id?: string) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for get_script_source');
+    }
+    const response = await this._callSingle('/api/get-script-source', { instancePath, startLine, endLine }, undefined, instance_id);
+
+    if (response.error) {
+      return this._textResult({ error: response.error, ...pathNotice(response) });
+    }
+    const pathStr = (response.instancePath as string) || instancePath;
+    const showRange = Boolean(response.isPartial || response.truncated)
+      && response.startLine !== undefined
+      && response.endLine !== undefined;
+    return this._textResult({
+      path: pathStr,
+      className: response.className,
+      lineCount: response.lineCount,
+      ...(typeof response.revision === 'string' ? { revision: response.revision } : {}),
+      ...(showRange ? { startLine: response.startLine, endLine: response.endLine } : {}),
+      ...(response.enabled === false ? { enabled: false } : {}),
+      ...(response.truncated ? { truncated: true } : {}),
+      ...(typeof response.note === 'string' && response.note.length > 0 ? { note: response.note } : {}),
+      ...pathNotice(response),
+      source: response.numberedSource || response.source,
+    });
+  }
+
+  async setScriptSource(instancePath: string, source: string, instance_id?: string, operation_id?: string, expected_revision?: string) {
+    if (!instancePath || typeof source !== 'string') {
+      throw new Error('Instance path and source code string are required for set_script_source');
+    }
+    const expectedRevision = optionalRevision('set_script_source', expected_revision);
+    const response = await this._callSingle('/api/set-script-source', {
+      instancePath,
+      source,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
+  }
+
+
+  async editScriptLines(
+    instancePath: string,
+    edits: ScriptEdit[],
+    options: { expectedRevision?: string; dryRun?: boolean } = {},
+    instance_id?: string,
+    operation_id?: string,
+  ) {
+    if (!instancePath || !Array.isArray(edits) || edits.length === 0) {
+      throw new Error('Instance path and old_string/new_string or edits are required for edit_script_lines');
+    }
+    if (edits.length > MAX_SCRIPT_EDITS) {
+      throw new Error(`edit_script_lines accepts at most ${MAX_SCRIPT_EDITS} edits`);
+    }
+    edits.forEach((edit, index) => {
+      if (typeof edit.oldString !== 'string' || typeof edit.newString !== 'string') {
+        throw new Error(edits.length === 1
+          ? 'Instance path, old_string, and new_string are required for edit_script_lines'
+          : `edit_script_lines edits[${index}] requires old_string and new_string`);
+      }
+    });
+    const { expectedRevision, dryRun } = options;
+    if (expectedRevision !== undefined && (typeof expectedRevision !== 'string' || expectedRevision.length === 0)) {
+      throw new Error('edit_script_lines expected_revision must be a nonempty string');
+    }
+    if (dryRun !== undefined && typeof dryRun !== 'boolean') {
+      throw new Error('edit_script_lines dry_run must be a boolean');
+    }
+
+    const payload: Record<string, unknown> = { instancePath };
+    if (edits.length === 1 && expectedRevision === undefined && !dryRun) {
+      // A plain single edit keeps the legacy shape. Batches, revisions, and
+      // previews only use `edits`, so a plugin that predates them rejects the
+      // request for missing old_string instead of applying it unchecked.
+      const [edit] = edits;
+      payload.old_string = edit.oldString;
+      payload.new_string = edit.newString;
+      if (edit.startLine !== undefined) payload.startLine = edit.startLine;
+    } else {
+      payload.edits = edits.map((edit) => ({
+        old_string: edit.oldString,
+        new_string: edit.newString,
+        ...(edit.startLine !== undefined ? { startLine: edit.startLine } : {}),
+      }));
+      if (expectedRevision !== undefined) payload.expectedRevision = expectedRevision;
+      if (dryRun) payload.dryRun = true;
+    }
+    const response = await this._callSingle('/api/edit-script-lines', payload, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
+  }
+
+  async insertScriptLines(
+    instancePath: string,
+    afterLine: number,
+    newContent: string,
+    instance_id?: string,
+    operation_id?: string,
+    expected_revision?: string,
+  ) {
+    if (!instancePath || typeof newContent !== 'string') {
+      throw new Error('Instance path and newContent are required for insert_script_lines');
+    }
+    const expectedRevision = optionalRevision('insert_script_lines', expected_revision);
+    const response = await this._callSingle('/api/insert-script-lines', {
+      instancePath,
+      afterLine: afterLine || 0,
+      newContent,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
+  }
+
+  async deleteScriptLines(
+    instancePath: string,
+    startLine: number,
+    endLine: number,
+    instance_id?: string,
+    operation_id?: string,
+    expected_revision?: string,
+  ) {
+    if (!instancePath || !startLine || !endLine) {
+      throw new Error('Instance path, startLine, and endLine are required for delete_script_lines');
+    }
+    const expectedRevision = optionalRevision('delete_script_lines', expected_revision);
+    const response = await this._callSingle('/api/delete-script-lines', {
+      instancePath,
+      startLine,
+      endLine,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
+  }
+
+
+  async grepScripts(
+    pattern: string,
+    options?: {
+      caseSensitive?: boolean;
+      usePattern?: boolean;
+      contextLines?: number;
+      maxResults?: number;
+      maxResultsPerScript?: number;
+      filesOnly?: boolean;
+      path?: string;
+      classFilter?: string;
+    },
+    instance_id?: string,
+    signal?: AbortSignal,
+  ) {
+    if (!pattern) {
+      throw new Error('Pattern is required for grep_scripts');
+    }
+    if (Buffer.byteLength(pattern, 'utf8') > MAX_GREP_PATTERN_UTF8_BYTES) {
+      throw new Error(`Pattern must not exceed ${MAX_GREP_PATTERN_UTF8_BYTES} UTF-8 bytes`);
+    }
+    assertScriptClassFilter('grep_scripts', options?.classFilter);
+    const response = await this._callSingle('/api/grep-scripts', {
+      pattern,
+      ...(options ?? {}),
+    }, undefined, instance_id, GREP_SCRIPTS_TIMEOUT_MS, signal);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async getAttributes(instancePath: string, instance_id?: string) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for get_attributes');
+    }
+    const response = await this._callSingle('/api/get-attributes', { instancePath }, undefined, instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async selection(
+    action: string,
+    opts: {
+      paths?: unknown;
+      mode?: string;
+      path?: string;
+      from?: number;
+      padding?: number;
+      angleY?: number;
+    } = {},
+    instance_id?: string,
+  ) {
+    if (action !== 'get' && action !== 'set' && action !== 'view') {
+      throw new Error('selection requires action=get|set|view');
+    }
+
+    if (action === 'get') {
+      return this.getSelection(instance_id);
+    }
+
+    if (action === 'set') {
+      if (!Array.isArray(opts.paths)) {
+        throw new Error('selection action=set requires a paths array; empty clears');
+      }
+      return this.setSelection(opts.paths, opts.mode, instance_id);
+    }
+
+    return this.focusViewport(opts.path, opts.from, opts.padding, opts.angleY, instance_id);
+  }
+
+  async getSelection(instance_id?: string) {
+    const response = await this._callSingle('/api/get-selection', {}, 'edit', instance_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async setSelection(paths: string[], mode: string | undefined, instance_id?: string) {
+    if (!Array.isArray(paths) || paths.some(path => typeof path !== 'string' || path.length === 0)) {
+      throw new Error('selection paths must contain only non-empty instance paths');
+    }
+    const selectionMode = mode ?? 'set';
+    if (!['set', 'add', 'remove'].includes(selectionMode)) {
+      throw new Error(`selection mode must be "set", "add" or "remove" (got: ${selectionMode})`);
+    }
+    const response = await this._callSingle(
+      '/api/set-selection',
+      { paths, mode: selectionMode },
+      'edit',
+      instance_id,
+    );
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async focusViewport(
+    instancePath?: string,
+    from?: number,
+    padding?: number,
+    angleY?: number,
+    instance_id?: string,
+  ) {
+    if (instancePath !== undefined && (typeof instancePath !== 'string' || instancePath.length === 0)) {
+      throw new Error('selection path must be a non-empty instance path when provided');
+    }
+    if (padding !== undefined && (padding <= 0 || padding > 10)) {
+      throw new Error('selection padding must be greater than 0 and at most 10');
+    }
+    if (angleY !== undefined && (angleY < -89 || angleY > 89)) {
+      throw new Error('selection angleY must be between -89 and 89');
+    }
+
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const { instanceId, clientRole } = this._resolveRuntime(instance_id);
+    const response = await this._callSingle('/api/focus-viewport', {
+      path: instancePath,
+      from,
+      padding,
+      angleY,
+    }, clientRole ?? 'edit', instanceId);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async executeLuau(code: string, target?: string, instance_id?: string, operation_id?: string) {
+    if (!code) {
+      throw new Error('Code is required for execute_luau');
+    }
+    const response = await this._callSingle('/api/execute-luau', { code }, { requested: target, fallback: 'edit', accepts: anyRole }, instance_id, undefined, undefined, operation_id);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response)
+        }
+      ]
+    };
+  }
+
+  async evalServerRuntime(code: string | undefined, instance_id?: string, operation_id?: string, wait: RuntimeWaitOptions = {}, signal?: AbortSignal) {
+    if (!code && wait.wait_until === undefined) {
+      throw new Error('eval_server_runtime requires code or wait_until');
+    }
+    return this._evalRuntime('eval_server_runtime', 'server', code, instance_id, operation_id, wait, signal);
+  }
+
+  async evalClientRuntime(code: string | undefined, target?: string, instance_id?: string, operation_id?: string, wait: RuntimeWaitOptions = {}, signal?: AbortSignal) {
+    if (!code && wait.wait_until === undefined) {
+      throw new Error('eval_client_runtime requires code or wait_until');
+    }
+    if (target && !target.startsWith('client-')) {
+      throw new Error(`eval_client_runtime requires target=client-N (got: ${target})`);
+    }
+    return this._evalRuntime(
+      'eval_client_runtime', { requested: target, fallback: 'client-1', accepts: isClientRole }, code, instance_id, operation_id, wait, signal,
+    );
+  }
+
+  // operation_id binds the one run of `code`; wait_until probes repeat, so they never carry it.
+  private async _evalRuntime(
+    tool: string,
+    target: string | TargetChoice,
+    code: string | undefined,
+    instance_id: string | undefined,
+    operation_id: string | undefined,
+    wait: RuntimeWaitOptions,
+    signal: AbortSignal | undefined,
+  ): Promise<ToolCallResult> {
+    const condition = wait.wait_until;
+    if (condition === undefined) {
+      return this._textResult(await this._callSingle('/api/eval-runtime', { code }, target, instance_id, undefined, undefined, operation_id));
+    }
+    if (typeof condition !== 'string' || !condition.trim()) {
+      throw new Error(`${tool} wait_until must be a non-empty Luau expression or code block`);
+    }
+    const timeoutS = wait.timeout_s ?? DEFAULT_WAIT_TIMEOUT_S;
+    if (typeof timeoutS !== 'number' || !Number.isFinite(timeoutS) || timeoutS <= 0 || timeoutS > MAX_WAIT_TIMEOUT_S) {
+      throw new Error(`${tool} timeout_s must be a number above 0 and at most ${MAX_WAIT_TIMEOUT_S}`);
+    }
+    const pollMs = wait.poll_ms ?? DEFAULT_WAIT_POLL_MS;
+    if (!Number.isInteger(pollMs) || pollMs < 50 || pollMs > 10_000) {
+      throw new Error(`${tool} poll_ms must be an integer from 50 to 10000`);
+    }
+    // Key on the target as the caller passed it: an omitted target routes by
+    // instance_id, so it can reach a different peer than an explicit client-N.
+    const requestedTarget = typeof target === 'string' ? target : target.requested;
+    return this._withinResponseBudget(tool, 'wait_until', [instance_id, requestedTarget, code, condition, timeoutS, pollMs, operation_id], async () => {
+      const intervalMs = Math.max(pollMs, Math.ceil(timeoutS * 1000 / MAX_WAIT_PROBES));
+      const startedAt = Date.now();
+      const deadline = startedAt + timeoutS * 1000;
+      const finish = (body: Record<string, unknown>) => this._textResult({ ...body, elapsed_ms: Date.now() - startedAt });
+      // Once a request has been routed, a later routing failure means the peer
+      // left mid-wait; before that it is the caller's targeting error.
+      let routedRole: string | undefined;
+      const send = (data: { code: string }, timeoutMs?: number, requestSignal?: AbortSignal, operationId?: string) =>
+        this._withSinglePeer(target, instance_id, requestSignal, (targetPeerId) => {
+          routedRole = this.bridge.getPeerById(targetPeerId)?.role
+            ?? (typeof target === 'string' ? target : target.requested ?? target.fallback);
+          return this._requestPeer('/api/eval-runtime', data, targetPeerId, timeoutMs, requestSignal, operationId);
+        });
+      let codeResult: Record<string, unknown> = {};
+      if (code) {
+        const response = await send({ code }, undefined, undefined, operation_id);
+        if (response.ok !== true) {
+          return finish({ ...response, satisfied: false, polls: 0, error: `code failed, so wait_until was not polled: ${String(response.error ?? 'unknown error')}` });
+        }
+        codeResult = { code_result: response.result, code_output: response.output };
+      }
+      // The expression form runs first, so `return` inside a string, a comment, or
+      // a nested function stays part of the expression. Text that only loads as a
+      // block switches to the block form for the rest of the wait.
+      let form: WaitProbeForm = 'expression';
+      let probe = buildWaitProbe(condition, form);
+      let polls = 0;
+      let lastValue: string | undefined;
+      let lastError: string | undefined;
+      for (;;) {
+        signal?.throwIfAborted();
+        polls += 1;
+        try {
+          const response = await send({ code: probe }, Math.max(1_000, Math.min(10_000, deadline - Date.now())), signal);
+          const reply = response.ok === true && typeof response.result === 'string' ? response.result : undefined;
+          if (reply !== undefined && (reply.startsWith('T') || reply.startsWith('F'))) {
+            lastValue = reply.slice(1);
+            lastError = undefined;
+            if (reply.startsWith('T')) return finish({ ...codeResult, satisfied: true, value: lastValue, polls });
+          } else {
+            lastError = String(response.error ?? `unexpected eval reply: ${JSON.stringify(response)}`);
+            if (response.error === PLAYTEST_NOT_RUNNING_ERROR) {
+              return finish({ ...codeResult, satisfied: false, polls, error: `The playtest stopped while waiting: ${lastError}` });
+            }
+            if (isWaitLoadFailure(response)) {
+              if (form === 'expression' && /\breturn\b/.test(condition)) {
+                form = 'block';
+                probe = buildWaitProbe(condition, form);
+                continue;
+              }
+              return finish({ ...codeResult, satisfied: false, polls, error: `wait_until does not compile: ${lastError}` });
+            }
+            // Waiting again would only cancel the same yield again.
+            if (lastError.includes(WAIT_YIELD_ERROR)) {
+              return finish({ ...codeResult, satisfied: false, polls, value: lastValue, error: lastError });
+            }
+          }
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          if (error instanceof RoutingFailure) {
+            if (routedRole === undefined) throw error;
+            return finish({ ...codeResult, satisfied: false, polls, value: lastValue, error: `The ${routedRole} peer is gone, so wait_until cannot finish: ${error.message}` });
+          }
+          lastError = errorMessage(error);
+        }
+        if (polls >= MAX_WAIT_PROBES || Date.now() + intervalMs >= deadline) break;
+        await sleepUnlessAborted(intervalMs, signal);
+      }
+      signal?.throwIfAborted();
+      return finish({
+        ...codeResult,
+        satisfied: false,
+        polls,
+        value: lastValue,
+        lastError,
+        error: `wait_until timed out after ${timeoutS}s: the condition never became truthy.`,
+      });
+    });
+  }
+
+  async setNetworkProfile(profile: string, target?: string, overrides?: Record<string, unknown>, instance_id?: string) {
+    const values = normalizeNetworkProfile(profile, overrides);
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const instanceId = this._resolveInstanceIdOnly(instance_id);
+    const clientRoles = this._clientRolesForScope(instanceId);
+    const selectedTarget = this._targetForInstanceId(instance_id, { requested: target, fallback: 'client-1', accepts: isClientRole });
+
+    let targetRoles: string[];
+    if (selectedTarget === 'all-clients') {
+      targetRoles = clientRoles;
+    } else if (/^client-\d+$/.test(selectedTarget)) {
+      if (!clientRoles.includes(selectedTarget)) {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: `instance "${instanceId}" has no role "${selectedTarget}". Available client roles: ${clientRoles.join(', ') || 'none'}.`,
+          data: this._routingErrorData(),
+        });
+      }
+      targetRoles = [selectedTarget];
+    } else {
+      throw new Error(`set_network_profile target must be "client-N" or "all-clients" (got: ${selectedTarget})`);
+    }
+
+    if (targetRoles.length === 0) {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: `instance "${instanceId}" has no connected playtest client roles. Start a playtest first.`,
+        data: this._routingErrorData(),
+      });
+    }
+
+    const code = buildNetworkProfileLuau(profile, values);
+    const responses = await Promise.allSettled(
+      targetRoles.map(async (role) => {
+        const response = await this._request('/api/execute-luau', { code }, instanceId, role);
+        const result = this._parseExecuteLuauJsonResponse(response, 'set_network_profile');
+        return { role, result };
+      }),
+    );
+
+    const body: Record<string, unknown> = {
+      profile,
+      target: selectedTarget,
+      applied: values,
+      targets: {},
+    };
+    const targetResults = body.targets as Record<string, unknown>;
+    const failures: string[] = [];
+    for (let i = 0; i < responses.length; i++) {
+      const role = targetRoles[i];
+      const response = responses[i];
+      if (response.status === 'fulfilled') {
+        targetResults[role] = response.value.result;
+      } else {
+        const message = errorMessage(response.reason);
+        targetResults[role] = { error: message };
+        failures.push(`${role}: ${message}`);
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(`set_network_profile failed for ${failures.join('; ')}. Partial result: ${JSON.stringify(body)}`);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(body),
+        },
+      ],
+    };
+  }
+
+  async getSimulationState(include?: string, target?: string, instance_id?: string) {
+    const selectedInclude = this._normalizeSimulationInclude(include);
+    const includeNetwork = selectedInclude === 'network' || selectedInclude === 'both';
+    const includeDeviceSimulator = selectedInclude === 'deviceSimulator' || selectedInclude === 'both';
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const resolved = this._resolveSimulationTargets(target, instance_id, 'get_simulation_state');
+
+    const roleEntries = await Promise.all(resolved.roles.map(async (role) => {
+      const state: Record<string, unknown> = {};
+      const errors: Record<string, { code: string; message: string }> = {};
+
+      if (includeNetwork) {
+        try {
+          state.network = await this._executeNetworkStateOperation(resolved.instanceId, role, 'get');
+        } catch (error) {
+          errors.network = codedError(error);
+        }
+      }
+
+      if (includeDeviceSimulator) {
+        try {
+          state.deviceSimulator = await this._executeDeviceSimulatorOperation(
+            resolved.instanceId,
+            role,
+            'get',
+            { includeDeviceList: false },
+          );
+        } catch (error) {
+          errors.deviceSimulator = codedError(error);
+        }
+      }
+
+      if (Object.keys(errors).length > 0) {
+        state.errors = errors;
+      }
+      return { role, state };
+    }));
+
+    const roles: Record<string, unknown> = {};
+    for (const entry of roleEntries) {
+      roles[entry.role] = entry.state;
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          include: selectedInclude,
+          target: resolved.selectedTarget,
+          roles,
+          warnings: resolved.warnings,
+          persistenceNotes: SIMULATION_PERSISTENCE_NOTES,
+        }),
+      }],
+    };
+  }
+
+  async resetSimulationState(target?: string, network?: boolean, deviceSimulator?: boolean, instance_id?: string) {
+    const resetNetwork = network !== false;
+    const resetDeviceSimulator = deviceSimulator !== false;
+    if (!resetNetwork && !resetDeviceSimulator) {
+      throw new Error('reset_simulation_state requires network=true and/or deviceSimulator=true; both default to true');
+    }
+
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const resolved = this._resolveSimulationTargets(target, instance_id, 'reset_simulation_state');
+    const roleEntries = await Promise.all(resolved.roles.map(async (role) => {
+      const result: Record<string, unknown> = {};
+      const errors: Record<string, string> = {};
+
+      if (resetNetwork) {
+        try {
+          result.network = await this._executeNetworkStateOperation(resolved.instanceId, role, 'reset');
+        } catch (error) {
+          errors.network = errorMessage(error);
+        }
+      }
+
+      if (resetDeviceSimulator) {
+        try {
+          result.deviceSimulator = await this._executeDeviceSimulatorOperation(
+            resolved.instanceId,
+            role,
+            'set',
+            { stopSimulation: true },
+          );
+        } catch (error) {
+          errors.deviceSimulator = errorMessage(error);
+        }
+      }
+
+      if (Object.keys(errors).length > 0) {
+        result.errors = errors;
+      }
+      return { role, result };
+    }));
+
+    const rawRoles: Record<string, unknown> = {};
+    const roles: Record<string, unknown> = {};
+    const failures: string[] = [];
+    for (const entry of roleEntries) {
+      rawRoles[entry.role] = entry.result;
+      roles[entry.role] = this._compactSimulationResetResult(entry.result);
+      const errors = (entry.result as { errors?: Record<string, string> }).errors;
+      if (errors) {
+        for (const [kind, message] of Object.entries(errors)) {
+          failures.push(`${entry.role}.${kind}: ${message}`);
+        }
+      }
+    }
+
+    const body = {
+      success: true,
+      target: resolved.selectedTarget,
+      network: resetNetwork,
+      deviceSimulator: resetDeviceSimulator,
+      roles,
+      warnings: resolved.warnings,
+    };
+
+    if (failures.length > 0) {
+      throw new Error(`reset_simulation_state failed for ${failures.join('; ')}. Partial result: ${JSON.stringify({ ...body, roles: rawRoles })}`);
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(body),
+      }],
+    };
+  }
+
+  async getDeviceSimulatorState(target?: string, deviceId?: string, includeDeviceList?: boolean, instance_id?: string) {
+    if (deviceId !== undefined && (typeof deviceId !== 'string' || deviceId.trim() === '')) {
+      throw new Error('deviceId must be a non-empty string when provided');
+    }
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const resolved = this._resolveDeviceSimulatorSingleTarget(target, instance_id, 'get_device_simulator_state');
+    const state = await this._executeDeviceSimulatorOperation(
+      resolved.instanceId,
+      resolved.role,
+      'get',
+      {
+        includeDeviceList: includeDeviceList !== false,
+        deviceId,
+      },
+    );
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          target: resolved.selectedTarget,
+          role: resolved.role,
+          ...(state as Record<string, unknown>),
+        }),
+      }],
+    };
+  }
+
+  async setDeviceSimulator(
+    target?: string,
+    deviceId?: string,
+    orientation?: string,
+    resolution?: unknown,
+    pixelDensity?: number,
+    scalingMode?: string,
+    stopSimulation?: boolean,
+    instance_id?: string,
+  ) {
+    const settings = normalizeDeviceSimulatorSettings({ deviceId, orientation, resolution, pixelDensity, scalingMode });
+    if (stopSimulation === true && hasDeviceSimulatorSettings(settings)) {
+      throw new Error('stopSimulation=true cannot be combined with deviceId, orientation, resolution, pixelDensity, or scalingMode');
+    }
+    if (stopSimulation !== true && !hasDeviceSimulatorSettings(settings)) {
+      throw new Error('set_device_simulator requires stopSimulation=true or at least one simulator setting');
+    }
+
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const resolved = this._resolveDeviceSimulatorSetTargets(target, instance_id);
+    const responses = await Promise.allSettled(
+      resolved.roles.map(async (role) => {
+        const result = await this._executeDeviceSimulatorOperation(
+          resolved.instanceId,
+          role,
+          'set',
+          stopSimulation === true ? { stopSimulation: true } : { settings },
+        );
+        return { role, result };
+      }),
+    );
+
+    const body: Record<string, unknown> = {
+      target: resolved.selectedTarget,
+      targets: {},
+    };
+    const targets = body.targets as Record<string, unknown>;
+    const failures: string[] = [];
+    for (let i = 0; i < responses.length; i++) {
+      const role = resolved.roles[i];
+      const response = responses[i];
+      if (response.status === 'fulfilled') {
+        targets[role] = response.value.result;
+      } else {
+        const message = errorMessage(response.reason);
+        targets[role] = { error: message };
+        failures.push(`${role}: ${message}`);
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(`set_device_simulator failed for ${failures.join('; ')}. Partial result: ${JSON.stringify(body)}`);
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(body),
+      }],
+    };
+  }
+
+  async captureDeviceMatrix(
+    entries: unknown,
+    target?: string,
+    format?: string,
+    quality?: number,
+    settleSeconds?: number,
+    restoreAfter?: boolean,
+    instance_id?: string,
+  ) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error('capture_device_matrix requires a non-empty entries array');
+    }
+    if (entries.length > MAX_DEVICE_MATRIX_ENTRIES) {
+      throw new Error(`capture_device_matrix supports at most ${MAX_DEVICE_MATRIX_ENTRIES} entries per call; split larger matrices into multiple calls`);
+    }
+
+    const matrixEntries: DeviceSimulatorMatrixEntry[] = entries.map((entry, index) => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        throw new Error(`entries[${index}] must be an object`);
+      }
+      const raw = entry as Record<string, unknown>;
+      if (raw.label !== undefined && typeof raw.label !== 'string') {
+        throw new Error(`entries[${index}].label must be a string when provided`);
+      }
+      return {
+        ...normalizeDeviceSimulatorSettings({
+          deviceId: raw.deviceId,
+          orientation: raw.orientation,
+          resolution: raw.resolution,
+          pixelDensity: raw.pixelDensity,
+          scalingMode: raw.scalingMode,
+        }),
+        label: raw.label as string | undefined,
+      };
+    });
+
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const resolved = this._resolveDeviceSimulatorSingleTarget(target, instance_id, 'capture_device_matrix');
+    if (resolved.role.startsWith('client-') && await this._isMultiplayerTestRunning(resolved.instanceId)) {
+      throw new Error('capture_device_matrix does not support StudioTestService multiplayer client targets because Roblox scopes temporary screenshot textures per client process');
+    }
+
+    const settleMs = settleSeconds === undefined ? 300 : Math.max(0, Math.floor(settleSeconds * 1000));
+    const shouldRestore = restoreAfter !== false;
+    const before = await this._executeDeviceSimulatorOperation(
+      resolved.instanceId,
+      resolved.role,
+      'get',
+      { includeDeviceList: shouldRestore },
+    );
+    if (shouldRestore) {
+      this._assertCanRestoreDeviceSimulatorState(before);
+    }
+
+    const summary: Record<string, unknown> = {
+      target: resolved.selectedTarget,
+      role: resolved.role,
+      restoreAfter: shouldRestore,
+      before: this._deviceSimulatorStateWithoutDeviceList(before),
+      entries: [],
+    };
+    const entrySummaries = summary.entries as Array<Record<string, unknown>>;
+    const content: ToolContent[] = [];
+    const failures: string[] = [];
+    let imageBudget = MAX_MATRIX_IMAGE_BYTES;
+
+    try {
+      for (let i = 0; i < matrixEntries.length; i++) {
+        const entry = matrixEntries[i];
+        const label = entry.label ?? `entry-${i + 1}`;
+        const entrySummary: Record<string, unknown> = {
+          index: i,
+          label,
+          settings: entry,
+        };
+        entrySummaries.push(entrySummary);
+
+        try {
+          const settings = { ...entry };
+          delete settings.label;
+          const applied = await this._executeDeviceSimulatorOperation(
+            resolved.instanceId,
+            resolved.role,
+            'set',
+            { settings },
+          );
+          entrySummary.applied = applied;
+          if (settleMs > 0) await sleep(settleMs);
+
+          const entryBudget = Math.max(1, Math.floor(imageBudget / (matrixEntries.length - i)));
+          const capture = await this._captureViewportImage(resolved.instanceId, resolved.role, format, quality, entryBudget);
+          if (capture.success) {
+            imageBudget -= Math.ceil((capture.data.length * 3) / 4);
+            entrySummary.screenshot = {
+              width: capture.width,
+              height: capture.height,
+              format: capture.format,
+              quality: capture.quality,
+              mimeType: capture.mimeType,
+            };
+            content.push({
+              type: 'text',
+              text: `capture_device_matrix ${i + 1}/${matrixEntries.length} ${label}: ${capture.message}`,
+            });
+            content.push({
+              type: 'image',
+              data: capture.data,
+              mimeType: capture.mimeType,
+            });
+          } else {
+            entrySummary.error = capture.error;
+            failures.push(`${label}: ${capture.error}`);
+            content.push({
+              type: 'text',
+              text: `capture_device_matrix ${i + 1}/${matrixEntries.length} ${label}: ${capture.error}`,
+            });
+          }
+        } catch (error) {
+          const message = errorMessage(error);
+          entrySummary.error = message;
+          failures.push(`${label}: ${message}`);
+          content.push({
+            type: 'text',
+            text: `capture_device_matrix ${i + 1}/${matrixEntries.length} ${label}: ${message}`,
+          });
+        }
+      }
+    } finally {
+      if (shouldRestore) {
+        try {
+          const restoreSettings = this._settingsFromDeviceSimulatorState(before);
+          if ('stopSimulation' in restoreSettings) {
+            summary.restore = await this._executeDeviceSimulatorOperation(
+              resolved.instanceId,
+              resolved.role,
+              'set',
+              { stopSimulation: true },
+            );
+          } else {
+            summary.restore = await this._executeDeviceSimulatorOperation(
+              resolved.instanceId,
+              resolved.role,
+              'set',
+              { settings: restoreSettings },
+            );
+          }
+        } catch (error) {
+          const message = errorMessage(error);
+          summary.restoreError = message;
+          failures.push(`restore: ${message}`);
+        }
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(`capture_device_matrix failed for ${failures.join('; ')}. Partial result: ${JSON.stringify(summary)}`);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(summary),
+        },
+        ...content,
+      ],
+    };
+  }
+
+  async getRuntimeLogs(
+    instance_id?: string,
+    multiplayer_group_id?: string,
+    cursor?: string,
+    cursor_by_instance?: Record<string, string>,
+    tail?: number,
+    filter?: string,
+    signal?: AbortSignal,
+  ) {
+    if (instance_id !== undefined && multiplayer_group_id !== undefined) {
+      throw new Error('get_runtime_logs accepts only one of instance_id or multiplayer_group_id.');
+    }
+    if (cursor !== undefined && cursor_by_instance !== undefined) {
+      throw new Error('get_runtime_logs accepts only one of cursor or cursor_by_instance.');
+    }
+    if (tail !== undefined && (!Number.isInteger(tail) || tail < 0)) {
+      throw new Error('get_runtime_logs tail must be a non-negative integer.');
+    }
+
+    // Capture one fresh topology before resolving the log scope and its fanout.
+    // Keep subsequent snapshot reads synchronous so they cannot refresh midway.
+    const refresh = this.bridge.refreshTopologyForRouting(signal);
+    if (refresh) await refresh;
+
+    const instances = this.bridge.getInstances();
+    const groups = this.bridge.getMultiplayerGroups();
+    let selectedGroup = multiplayer_group_id === undefined
+      ? undefined
+      : groups.find((group) => group.id === multiplayer_group_id);
+    let selectedInstanceId = instance_id === undefined
+      ? undefined
+      : this._resolveInstanceIdOnly(instance_id);
+
+    if (multiplayer_group_id !== undefined && !selectedGroup) {
+      throw new RoutingFailure({
+        code: 'unrecognized_instance_id',
+        message: `multiplayer_group_id "${multiplayer_group_id}" is not connected.`,
+        data: this._routingErrorData(),
+      });
+    }
+    if (selectedInstanceId !== undefined && !instances.some((instance) => instance.id === selectedInstanceId)) {
+      throw new RoutingFailure({
+        code: 'unrecognized_instance_id',
+        message: `instance_id "${selectedInstanceId}" is not connected. Pass a connected top-level or grouped role-suffixed Instance ID.`,
+        data: this._routingErrorData(),
+      });
+    }
+
+    if (selectedGroup === undefined && selectedInstanceId === undefined) {
+      const groupedInstanceIds = new Set(groups.flatMap((group) => group.instanceIds));
+      const standaloneInstanceIds = instances
+        .map((instance) => instance.id)
+        .filter((id) => !groupedInstanceIds.has(id));
+      const scopeCount = groups.length + standaloneInstanceIds.length;
+      if (scopeCount === 0) {
+        throw new RoutingFailure({
+          code: 'unrecognized_instance_id',
+          message: 'No Studio plugin is connected.',
+          data: this._routingErrorData(),
+        });
+      }
+      if (scopeCount > 1) {
+        throw new RoutingFailure({
+          code: 'multiple_instances_connected',
+          message: 'Multiple Studio process scopes are connected. Pass instance_id or multiplayer_group_id.',
+          data: this._routingErrorData(),
+        });
+      }
+      if (groups.length === 1) {
+        selectedGroup = groups[0];
+      } else {
+        selectedInstanceId = standaloneInstanceIds[0];
+      }
+    }
+
+    if (selectedGroup !== undefined && cursor !== undefined) {
+      throw new Error('Use cursor_by_instance when reading a multiplayer group.');
+    }
+    if (selectedGroup === undefined && cursor_by_instance !== undefined) {
+      throw new Error('Use cursor when reading one Instance.');
+    }
+
+    type RuntimeLogCursorPayload = {
+      version: 1;
+      instanceId: string;
+      peers: Record<string, number>;
+    };
+    type RuntimeLogPeerSuccess = {
+      peerId: string;
+      role: string;
+      entries: unknown[];
+      totalDropped: number;
+      nextSince: number;
+    };
+    type RuntimeLogPeerError = {
+      peerId: string;
+      role: string;
+      error: string;
+    };
+    type RuntimeLogInstanceResult =
+      | {
+        instanceId: string;
+        entries: unknown[];
+        totalDropped: number;
+        nextCursor: string;
+        peerErrors?: RuntimeLogPeerError[];
+      }
+      | {
+        instanceId: string;
+        error: string;
+        nextCursor: string;
+        peerErrors: RuntimeLogPeerError[];
+      };
+
+    const decodeCursor = (value: string | undefined, instanceId: string): Record<string, number> => {
+      if (value === undefined) return {};
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+      } catch {
+        throw new Error(`get_runtime_logs received an invalid cursor for Instance "${instanceId}".`);
+      }
+      if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
+        throw new Error(`get_runtime_logs received an invalid cursor for Instance "${instanceId}".`);
+      }
+      const payload = decoded as Record<string, unknown>;
+      if (
+        payload.version !== 1 ||
+        payload.instanceId !== instanceId ||
+        typeof payload.peers !== 'object' ||
+        payload.peers === null ||
+        Array.isArray(payload.peers)
+      ) {
+        throw new Error(`get_runtime_logs cursor does not belong to Instance "${instanceId}".`);
+      }
+      const peers = payload.peers as Record<string, unknown>;
+      const parsed: Record<string, number> = {};
+      for (const [peerId, nextSince] of Object.entries(peers)) {
+        if (typeof nextSince !== 'number' || !Number.isInteger(nextSince) || nextSince < 0) {
+          throw new Error(`get_runtime_logs received an invalid cursor for Instance "${instanceId}".`);
+        }
+        parsed[peerId] = nextSince;
+      }
+      return parsed;
+    };
+
+    const encodeCursor = (instanceId: string, peers: Record<string, number>): string => {
+      const orderedPeers: Record<string, number> = {};
+      for (const peerId of Object.keys(peers).sort()) orderedPeers[peerId] = peers[peerId];
+      const payload: RuntimeLogCursorPayload = {
+        version: 1,
+        instanceId,
+        peers: orderedPeers,
+      };
+      return Buffer.from(JSON.stringify(payload)).toString('base64url');
+    };
+
+    const roleRank = (role: string): number => {
+      if (role === 'edit') return 0;
+      if (role === 'server') return 1;
+      const client = /^client-(\d+)$/.exec(role);
+      return client ? 2 + Number(client[1]) : Number.MAX_SAFE_INTEGER;
+    };
+
+    const entryTimestamp = (entry: unknown): number => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return 0;
+      const record = entry as Record<string, unknown>;
+      return typeof record.ts === 'number' ? record.ts : 0;
+    };
+
+    const publicEntry = (entry: unknown): unknown => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return entry;
+      const record = entry as Record<string, unknown>;
+      const copy: Record<string, unknown> = { ...record };
+      delete copy.seq;
+      return copy;
+    };
+
+    const readInstance = async (
+      instanceId: string,
+      instanceCursor: string | undefined,
+    ): Promise<RuntimeLogInstanceResult> => {
+      const peers = this.bridge.getPeers()
+        .filter((peer) => peer.instanceId === instanceId)
+        .sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.peerId.localeCompare(b.peerId));
+      const priorByPeer = decodeCursor(instanceCursor, instanceId);
+      const nextByPeer: Record<string, number> = {};
+      for (const peer of peers) {
+        const prior = priorByPeer[peer.peerId];
+        if (prior !== undefined) nextByPeer[peer.peerId] = prior;
+      }
+      if (peers.length === 0) {
+        return {
+          instanceId,
+          error: 'No connected Peer exists for this Instance.',
+          nextCursor: encodeCursor(instanceId, nextByPeer),
+          peerErrors: [],
+        };
+      }
+
+      const reads = await Promise.all(peers.map(async (peer): Promise<RuntimeLogPeerSuccess | RuntimeLogPeerError> => {
+        const data: Record<string, unknown> = {};
+        const peerSince = priorByPeer[peer.peerId];
+        if (peerSince !== undefined) data.since = peerSince;
+        if (tail !== undefined) data.tail = tail;
+        if (filter !== undefined) data.filter = filter;
+        try {
+          const responseValue: unknown = await this.client.request(
+            '/api/get-runtime-logs',
+            data,
+            peer.peerId,
+            RUNTIME_LOG_PEER_TIMEOUT_MS,
+            signal,
+          );
+          if (typeof responseValue !== 'object' || responseValue === null || Array.isArray(responseValue)) {
+            return {
+              peerId: peer.peerId,
+              role: peer.role,
+              error: 'Studio returned an invalid runtime log response.',
+            };
+          }
+          const response = responseValue as Record<string, unknown>;
+          if (typeof response.error === 'string') {
+            // Broker failures carry a code in `error` and the diagnosis in `message`.
+            const error = typeof response.message === 'string' && response.message !== ''
+              ? `${response.error}: ${response.message}` : response.error;
+            return { peerId: peer.peerId, role: peer.role, error };
+          }
+          if (
+            !Array.isArray(response.entries) ||
+            typeof response.totalDropped !== 'number' ||
+            typeof response.nextSince !== 'number'
+          ) {
+            return {
+              peerId: peer.peerId,
+              role: peer.role,
+              error: 'Studio returned an invalid runtime log response.',
+            };
+          }
+          return {
+            peerId: peer.peerId,
+            role: peer.role,
+            entries: response.entries,
+            totalDropped: response.totalDropped,
+            nextSince: response.nextSince,
+          };
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          return { peerId: peer.peerId, role: peer.role, error: errorMessage(error) };
+        }
+      }));
+
+      const successful: RuntimeLogPeerSuccess[] = [];
+      const peerErrors: RuntimeLogPeerError[] = [];
+      for (const read of reads) {
+        if ('error' in read) {
+          peerErrors.push(read);
+        } else {
+          successful.push(read);
+          nextByPeer[read.peerId] = read.nextSince;
+        }
+      }
+      const nextCursor = encodeCursor(instanceId, nextByPeer);
+      if (successful.length === 0) {
+        return {
+          instanceId,
+          error: 'Every connected Peer failed to read its runtime log buffer.',
+          nextCursor,
+          peerErrors,
+        };
+      }
+
+      let insertionOrder = 0;
+      const merged = successful.flatMap((read) =>
+        read.entries.map((entry) => ({
+          entry: publicEntry(entry),
+          timestamp: entryTimestamp(entry),
+          insertionOrder: insertionOrder++,
+        }))
+      );
+      merged.sort((a, b) => a.timestamp - b.timestamp || a.insertionOrder - b.insertionOrder);
+      const allEntries = merged.map((item) => item.entry);
+      const entries = tail === undefined
+        ? allEntries
+        : tail === 0
+          ? []
+          : allEntries.slice(-tail);
+      const totalDropped = successful.reduce((total, read) => total + read.totalDropped, 0);
+      return {
+        instanceId,
+        entries,
+        totalDropped,
+        nextCursor,
+        ...(peerErrors.length > 0 ? { peerErrors } : {}),
+      };
+    };
+
+    if (selectedGroup) {
+      const connectedIds = new Set(instances.map((instance) => instance.id));
+      const instanceIds = selectedGroup.instanceIds.filter((id) => connectedIds.has(id));
+      const results = await Promise.all(instanceIds.map((instanceId) =>
+        readInstance(instanceId, cursor_by_instance?.[instanceId])
+      ));
+      const nextCursorByInstance: Record<string, string> = {};
+      for (const result of results) nextCursorByInstance[result.instanceId] = result.nextCursor;
+      return this._textResult({
+        multiplayerGroupId: selectedGroup.id,
+        instances: results,
+        nextCursorByInstance,
+      });
+    }
+
+    const result = await readInstance(selectedInstanceId as string, cursor);
+    if ('error' in result) {
+      throw new Error(`get_runtime_logs failed for Instance "${result.instanceId}": ${result.error}`);
+    }
+    return this._textResult(result);
+  }
+
+  async captureScriptProfiler(target?: string, request: Record<string, unknown> = {}, instance_id?: string) {
+    const data: Record<string, unknown> = { ...request };
+    const outputPath = data.output_path;
+    delete data.output_path;
+
+    if (outputPath !== undefined && typeof outputPath !== 'string') {
+      throw new Error('output_path must be a string when provided');
+    }
+    if (outputPath) {
+      data.__mcp_include_raw_json = true;
+    }
+
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const targetRole = this._targetForInstanceId(instance_id, { requested: target, fallback: 'server', accepts: isRuntimeRole });
+    const resolved = this.bridge.resolveTarget({ instance_id, target: targetRole });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: 'capture_script_profiler profiles one runtime peer at a time. Pick target="server" or a specific "client-N".',
+        data: this._routingErrorData(),
+      });
+    }
+
+    data.__mcp_instance_id = resolved.targetInstanceId;
+    data.__mcp_target_role = resolved.targetRole;
+    const response = await this._requestPeer(
+      '/api/capture-script-profiler',
+      data,
+      resolved.targetPeerId,
+    );
+
+    const body: unknown = response !== null && typeof response === 'object' && !Array.isArray(response)
+      ? { ...response, target: resolved.targetRole }
+      : response;
+
+    if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
+      const mutable = body as Record<string, unknown>;
+      const rawJson = mutable.raw_json;
+      if (typeof rawJson === 'string') {
+        if (typeof outputPath === 'string' && outputPath !== '') {
+          const resolvedOutputPath = path.resolve(outputPath);
+          fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
+          fs.writeFileSync(resolvedOutputPath, rawJson, 'utf8');
+          mutable.output_path = resolvedOutputPath;
+        }
+        delete mutable.raw_json;
+      }
+    }
+
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  }
+
+  async captureMicroProfiler(target?: string, request: Record<string, unknown> = {}, instance_id?: string) {
+    const action = request.action ?? 'capture';
+    if (!isMicroProfilerAction(action)) {
+      throw new Error(`action must be one of ${MICRO_PROFILER_ACTIONS.join(', ')}`);
+    }
+    const outputPath = request.output_path;
+    const summaryOutputPath = request.summary_output_path;
+    const inputPath = request.input_path;
+    const baselinePath = request.baseline_path;
+    const baseline = request.baseline;
+    if (outputPath !== undefined && typeof outputPath !== 'string') {
+      throw new Error('output_path must be a string when provided');
+    }
+    if (summaryOutputPath !== undefined && typeof summaryOutputPath !== 'string') {
+      throw new Error('summary_output_path must be a string when provided');
+    }
+    const finish = {
+      summaryOutputPath,
+      baselinePath,
+      baseline,
+      baselineLabel: typeof request.baseline_label === 'string' ? request.baseline_label : undefined,
+      currentLabel: typeof request.current_label === 'string' ? request.current_label : undefined,
+      maxComparisonRows: typeof request.max_comparison_rows === 'number' ? request.max_comparison_rows : undefined,
+      includeComparisonIndex: request.include_comparison_index === true,
+    };
+    const analysisOptions = microProfilerAnalysisOptions(request);
+    analysisOptions.includeComparisonIndex = Boolean(summaryOutputPath || baselinePath || baseline || finish.includeComparisonIndex);
+
+    // A saved capture (an earlier capture_path, or a Studio "Dump in binary
+    // format" .gprx file) is analyzed without Studio.
+    if (action === 'analyze') {
+      if (typeof inputPath !== 'string' || inputPath === '') {
+        throw new Error('input_path is required for action="analyze": a capture_path from an earlier capture, or a MicroProfiler .gprx dump');
+      }
+      const resolvedInput = path.resolve(inputPath);
+      const bytes = await fs.promises.readFile(resolvedInput);
+      // A capture this tool saved re-analyzes over the frames it was recorded for.
+      const window = await readWindowSidecar(resolvedInput);
+      const summary = await analyzeMicroProfilerCapture(bytes, { ...analysisOptions, window });
+      summary.action = action;
+      summary.capture = { path: resolvedInput, bytes: bytes.length, source: 'file', recorded_window: window !== undefined };
+      return this._finishMicroProfilerResult(summary, finish);
+    }
+    if (inputPath !== undefined) {
+      throw new Error('input_path is only used with action="analyze"');
+    }
+
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const targetRole = this._targetForInstanceId(instance_id, { requested: target, fallback: 'server', accepts: isRuntimeRole });
+    const resolved = this.bridge.resolveTarget({ instance_id, target: targetRole });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: 'capture_micro_profiler profiles one runtime peer at a time. Pick target="server" or a specific "client-N".',
+        data: this._routingErrorData(),
+      });
+    }
+
+    const role = resolved.targetRole;
+    // Every Peer of a solo playtest runs in one Studio process, and MicroProfiler
+    // records the whole process. A client there is recorded through the server
+    // Peer: the same capture, copied back directly instead of through the
+    // client broker, which a large capture can overwhelm.
+    const processPeers = this.bridge.getPeers().filter((peer) => peer.instanceId === resolved.targetInstanceId);
+    const recorder = isClientRole(role) ? processPeers.find((peer) => peer.role === 'server') : undefined;
+    const peerId = recorder?.peerId ?? resolved.targetPeerId;
+    const recordedBy = recorder?.role ?? role;
+    const processRoles = processPeers.map((peer) => peer.role).sort((a, b) => roleOrder(a) - roleOrder(b));
+    const placement: Record<string, unknown> = {
+      target: role,
+      ...(recordedBy !== role ? { recorded_by: recordedBy } : {}),
+      ...(processRoles.length > 1 ? { process_roles: processRoles } : {}),
+    };
+    const durationMs = typeof request.duration_ms === 'number' && Number.isFinite(request.duration_ms)
+      ? Math.min(MICRO_PROFILER_MAX_DURATION_MS, Math.max(MICRO_PROFILER_MIN_DURATION_MS, Math.floor(request.duration_ms)))
+      : MICRO_PROFILER_DEFAULT_DURATION_MS;
+    const pluginRequest: Record<string, unknown> = {
+      action,
+      __mcp_instance_id: resolved.targetInstanceId,
+      __mcp_target_role: role,
+    };
+    if (action === 'capture') pluginRequest.duration_ms = durationMs;
+    // Recording waits in Studio; finalizing a stream and staging it takes a few seconds more.
+    const timeoutMs = action === 'capture' ? durationMs + MICRO_PROFILER_REQUEST_MARGIN_MS : MICRO_PROFILER_REQUEST_MARGIN_MS;
+    const response = await this._requestPeer('/api/capture-micro-profiler', pluginRequest, peerId, timeoutMs);
+    if (response === null || typeof response !== 'object' || Array.isArray(response)) {
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    }
+    const reply: Record<string, unknown> = { ...(response as Record<string, unknown>), ...placement };
+    if (action === 'start' || typeof reply.error === 'string') {
+      delete reply.transfer;
+      return typeof reply.error === 'string'
+        ? this._microProfilerFailure(reply, summaryOutputPath)
+        : { content: [{ type: 'text', text: JSON.stringify(reply) }] };
+    }
+    const transfer = parseCaptureTransfer(reply.transfer);
+    if (transfer === undefined) {
+      const staged = asRecord(reply.transfer)?.transfer_id;
+      if (typeof staged === 'string') {
+        await this._requestPeer('/api/micro-profiler-release', { transfer_id: staged }, peerId).catch(() => undefined);
+      }
+      return this._microProfilerFailure({
+        error: 'micro_profiler_transfer_invalid',
+        message: 'Studio finished the capture but did not stage readable capture data.',
+        ...placement,
+        recording: reply.recording,
+        transfer: reply.transfer,
+      }, summaryOutputPath);
+    }
+
+    const recording = asRecord(reply.recording) ?? {};
+    let bytes: Buffer;
+    try {
+      const throughBroker = isClientRole(recordedBy);
+      bytes = await pullCapture(
+        transfer,
+        throughBroker ? CLIENT_CHUNK_BYTES : SERVER_CHUNK_BYTES,
+        (chunk) => this._requestPeer('/api/micro-profiler-read', chunk, peerId, MICRO_PROFILER_REQUEST_MARGIN_MS),
+        throughBroker ? this.captureChunkPace : undefined,
+      );
+    } catch (error) {
+      await this._requestPeer('/api/micro-profiler-release', { transfer_id: transfer.transferId }, peerId).catch(() => undefined);
+      const detail = error instanceof CaptureTransferError ? error.detail : undefined;
+      return this._microProfilerFailure({
+        error: 'micro_profiler_transfer_failed',
+        message: `The capture was recorded but could not be copied from Studio: ${error instanceof Error ? error.message : String(error)}`,
+        ...placement,
+        recording,
+        detail,
+      }, summaryOutputPath);
+    }
+
+    // A capture that cannot be saved is still analyzed; the result says why.
+    let capturePath: string | undefined;
+    let saveError: string | undefined;
+    try {
+      const target = await resolveCapturePath(typeof outputPath === 'string' ? outputPath : undefined, role);
+      capturePath = target.path;
+      await writeCaptureFile(target, bytes);
+      await writeWindowSidecar(capturePath, role, recording);
+    } catch (error) {
+      saveError = `Could not save the capture${capturePath ? ` to ${capturePath}` : ''}: ${errorMessage(error)}`;
+      capturePath = undefined;
+    }
+
+    const summary = await analyzeMicroProfilerCapture(bytes, {
+      ...analysisOptions,
+      targetRole: role,
+      window: windowFromRecording(recording),
+    });
+    summary.action = action;
+    Object.assign(summary, placement);
+    summary.capture = {
+      path: capturePath,
+      save_error: saveError,
+      bytes: bytes.length,
+      source: 'studio',
+      method: recording.method,
+      first_frame_wait_ms: recording.first_frame_wait_ms,
+      stream: recording.stream,
+      stopped_by: recording.stopped_by,
+    };
+    if (reply.capture_state !== undefined) summary.capture_state = reply.capture_state;
+    const recordingNotes = Array.isArray(recording.notes) ? recording.notes.filter((note): note is string => typeof note === 'string') : [];
+    const stream = asRecord(recording.stream);
+    const quality = asRecord(summary.data_quality);
+    if (quality) {
+      const reasons = Array.isArray(quality.partial_reasons) ? quality.partial_reasons as string[] : [];
+      if (stream?.size_limit_reached === true) reasons.push('stream_size_limit_reached');
+      if (recording.stopped_by === 'max_duration') reasons.push('recording_time_limit_reached');
+      quality.partial_reasons = reasons;
+      quality.partial = reasons.length > 0;
+      if (processRoles.length > 1) {
+        recordingNotes.push(`This Studio process runs ${processRoles.join(', ')}, and MicroProfiler records the whole process, so this capture includes the timers of every role in it${recordedBy !== role ? ` (it was recorded through the ${recordedBy} Peer)` : ''}. Label your own work with debug.profilebegin to tell roles apart, or use multiplayer_playtest for a separate process per role.`);
+      }
+      if (recordingNotes.length > 0) {
+        const notes = Array.isArray(quality.notes) ? quality.notes as string[] : [];
+        quality.notes = [...recordingNotes, ...notes];
+      }
+    }
+    return this._finishMicroProfilerResult(summary, finish);
+  }
+
+  // A result without an analysis still reaches summary_output_path, so a
+  // harness that reads the file sees why there is no analysis.
+  private _microProfilerFailure(body: Record<string, unknown>, summaryOutputPath: string | undefined) {
+    if (typeof summaryOutputPath === 'string' && summaryOutputPath !== '') {
+      const resolvedSummaryPath = path.resolve(summaryOutputPath);
+      fs.mkdirSync(path.dirname(resolvedSummaryPath), { recursive: true });
+      fs.writeFileSync(resolvedSummaryPath, JSON.stringify(body, null, 2), 'utf8');
+      body.summary_output_path = resolvedSummaryPath;
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  }
+
+  private _finishMicroProfilerResult(
+    summary: Record<string, unknown>,
+    options: {
+      summaryOutputPath?: string;
+      baselinePath?: unknown;
+      baseline?: unknown;
+      baselineLabel?: string;
+      currentLabel?: string;
+      maxComparisonRows?: number;
+      includeComparisonIndex: boolean;
+    },
+  ) {
+    // Re-analysis suggestions read the capture this result came from.
+    const capturePath = asRecord(summary.capture)?.path;
+    if (typeof capturePath === 'string') {
+      for (const recommendation of asRows(summary.recommended_tools)) {
+        const args = asRecord(recommendation.arguments);
+        if (recommendation.tool === 'capture_micro_profiler' && args?.action === 'analyze') args.input_path = capturePath;
+      }
+    }
+    const baselineCapture = loadMicroProfilerBaseline(options.baseline, options.baselinePath);
+    if (baselineCapture) {
+      summary.baseline_comparison = compareMicroProfilerCaptures(summary, baselineCapture, {
+        baselineLabel: options.baselineLabel,
+        currentLabel: options.currentLabel,
+        maxRows: options.maxComparisonRows,
+      });
+    }
+    if (typeof options.summaryOutputPath === 'string' && options.summaryOutputPath !== '') {
+      const resolvedSummaryPath = path.resolve(options.summaryOutputPath);
+      fs.mkdirSync(path.dirname(resolvedSummaryPath), { recursive: true });
+      fs.writeFileSync(resolvedSummaryPath, JSON.stringify(summary, null, 2), 'utf8');
+      summary.summary_output_path = resolvedSummaryPath;
+    }
+    if (!options.includeComparisonIndex) {
+      delete summary.comparison_index;
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(summary) }] };
+  }
+
+  async breakpoints(action: string, request: Record<string, unknown> = {}, target?: string, instance_id?: string) {
+    if (!action || typeof action !== 'string') {
+      throw new Error('breakpoints requires action=set|remove|clear|list');
+    }
+    const data: Record<string, unknown> = { ...request, action };
+    delete data.target;
+    delete data.instance_id;
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const targetRole = this._targetForInstanceId(instance_id, { requested: target, fallback: 'edit', accepts: isRuntimeRole });
+    const resolved = this.bridge.resolveTarget({ instance_id, target: targetRole });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: 'This tool does not support target=all. Pick a specific role or omit target.',
+        data: this._routingErrorData(),
+      });
+    }
+    data.__mcp_target_role = resolved.targetRole;
+    const response = await this._requestPeer('/api/breakpoints', data, resolved.targetPeerId);
+    const body = response !== null && typeof response === 'object' && !Array.isArray(response)
+      ? { ...response, target: resolved.targetRole }
+      : response;
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  }
+
+  private _positiveInteger(value: unknown, name: string): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new Error(`${name} must be a positive number.`);
+    }
+    return Math.trunc(value);
+  }
+
+  private _optionalPositiveInteger(value: unknown, name: string): number | undefined {
+    if (value === undefined || value === null) return undefined;
+    return this._positiveInteger(value, name);
+  }
+
+  private _optionalFiniteNumber(value: unknown, name: string): number | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new Error(`${name} must be a finite number.`);
+    }
+    return value;
+  }
+
+  private _publicInstanceKey(peer: PublicStudioPeer): string {
+    return `${peer.peerId}:${peer.instanceId}:${peer.connectedAt}`;
+  }
+
+
+  private _matchesManagedLaunch(
+    record: ManagedStudioInstance,
+    instance: Pick<PublicStudioPeer, 'placeId' | 'placeName' | 'dataModelName'>,
+  ): boolean {
+    if (record.source === 'published_place') {
+      return record.placeId !== undefined && instance.placeId === record.placeId;
+    }
+    if ((record.source === 'baseplate' || record.source === 'local_file') && record.localPlaceFile) {
+      const expectedName = path.basename(record.localPlaceFile);
+      return instance.placeName === expectedName || instance.dataModelName === expectedName;
+    }
+    return true;
+  }
+
+  private async _associateManagedEditConnection(
+    instance: PublicStudioPeer,
+    instanceManager: StudioInstanceManager,
+  ): Promise<void> {
+    if (instance.role !== 'edit') return;
+    const candidate = (await instanceManager.pendingLaunches())
+      .filter((record) => instance.connectedAt >= record.launchedAt - 1000)
+      .filter((record) => this._matchesManagedLaunch(record, instance))
+      .sort((a, b) => a.launchedAt - b.launchedAt)[0];
+    if (candidate) await instanceManager.attachInstanceId(candidate, instance.instanceId);
+  }
+
+  private async _deriveUniverseId(placeId: number): Promise<number> {
+    const response = await fetch(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Could not resolve the universe for place_id ${placeId} (${response.status}): ${body}`);
+    }
+    const data = await response.json() as { universeId?: number };
+    if (typeof data.universeId !== 'number' || !Number.isFinite(data.universeId)) {
+      throw new Error(`Could not resolve the universe for place_id ${placeId}.`);
+    }
+    return Math.trunc(data.universeId);
+  }
+
+  private async _waitForManagedEditConnection(
+    record: ManagedStudioInstance,
+    beforeKeys: Set<string>,
+    timeoutMs: number,
+  ): Promise<PublicStudioPeer | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await this.instanceManager.refresh(record);
+      if (record.state === 'failed' || record.state === 'exited' || record.closedAt !== undefined) {
+        return undefined;
+      }
+      const candidates = this.bridge.getPublicPeers()
+        .filter((peer) => peer.role === 'edit')
+        .filter((instance) => !beforeKeys.has(this._publicInstanceKey(instance)))
+        .filter((instance) => instance.connectedAt >= record.launchedAt - 1000)
+        .filter((instance) => this._matchesManagedLaunch(record, instance))
+        .sort((a, b) => b.connectedAt - a.connectedAt);
+
+      if (candidates[0]) return candidates[0];
+      await sleep(500);
+    }
+    return undefined;
+  }
+
+  // The instance manager only knows the plugin never registered; a version
+  // rejection recorded during the launch window is the actionable cause.
+  private _managedFailureReason(record: ManagedStudioInstance): string | undefined {
+    if (record.failureReason !== PLUGIN_CONNECTION_TIMEOUT_REASON) return record.failureReason;
+    const rejection = this.bridge.getVersionRejections()
+      .filter((candidate) => candidate.role === 'edit' && candidate.rejectedAt >= record.launchedAt - 1000)
+      .filter((candidate) => this._matchesManagedLaunch(record, candidate))
+      .at(-1);
+    return rejection ? `Studio connected but was rejected: ${rejection.hint}` : record.failureReason;
+  }
+
+  private _managedStatus(record: ManagedStudioInstance): Record<string, unknown> {
+    const connected = record.instanceId
+      ? this.bridge.getPublicPeers().filter((peer) => peer.instanceId === record.instanceId)
+      : [];
+    return {
+      launch_id: record.recordId,
+      instance_id: record.instanceId,
+      managed: true,
+      state: record.state,
+      pid: record.nativeProcessId ?? record.spawnPid,
+      process_started_at_file_time: record.nativeProcessStartedAt,
+      process_authorized: record.processAuthorizationState !== 'pending',
+      process_ownership_released: record.processAuthorizationState === 'released',
+      process_running: record.closedAt !== undefined || record.exitedAt !== undefined
+        ? false
+        : record.processObservationStatus === 'running'
+          ? true
+          : record.processObservationStatus === 'not_running'
+            ? false
+            : null,
+      process_observation_status: record.processObservationStatus ?? 'unknown',
+      last_process_observation_at: record.lastProcessObservationAt
+        ? new Date(record.lastProcessObservationAt).toISOString()
+        : undefined,
+      last_successful_process_observation_at: record.lastSuccessfulProcessObservationAt
+        ? new Date(record.lastSuccessfulProcessObservationAt).toISOString()
+        : undefined,
+      last_process_observation_error: record.lastProcessObservationError,
+      consecutive_confirmed_misses: record.consecutiveConfirmedMisses ?? 0,
+      source: record.source,
+      local_place_file: record.localPlaceFile,
+      studio_working_directory: record.studioWorkingDirectory,
+      place_id: record.placeId,
+      place_version: record.placeVersion,
+      launched_at: new Date(record.launchedAt).toISOString(),
+      connected_at: record.connectedAt ? new Date(record.connectedAt).toISOString() : undefined,
+      failed_at: record.failedAt ? new Date(record.failedAt).toISOString() : undefined,
+      exited_at: record.exitedAt ? new Date(record.exitedAt).toISOString() : undefined,
+      exit_code: record.exitCode,
+      failure_reason: this._managedFailureReason(record),
+      connected: connected.length > 0,
+      roles: connected.map((instance) => instance.role).sort(),
+    };
+  }
+
+  private _versionNumberFromPath(pathValue: string): number | undefined {
+    const match = pathValue.match(/\/versions\/(\d+)$/);
+    return match ? Number(match[1]) : undefined;
+  }
+
+  async manageInstance(request: Record<string, unknown>) {
+    const action = request.action;
+    const instance_id = typeof request.instance_id === 'string' ? request.instance_id : undefined;
+    const launch_id = typeof request.launch_id === 'string' ? request.launch_id : undefined;
+
+    if (instance_id && launch_id) {
+      throw new Error('manage_instance accepts only one of instance_id or launch_id.');
+    }
+
+    if (
+      action !== 'launch' &&
+      action !== 'authorize' &&
+      action !== 'complete' &&
+      action !== 'close' &&
+      action !== 'status' &&
+      action !== 'list_place_versions'
+    ) {
+      throw new Error('manage_instance requires action=launch|authorize|complete|close|status|list_place_versions');
+    }
+
+    if (action === 'list_place_versions') {
+      if (!this.openCloudClient.hasApiKey()) {
+        return this._textResult({
+          error: 'ROBLOX_OPEN_CLOUD_API_KEY is required to list place versions.',
+        });
+      }
+      const placeId = this._positiveInteger(request.place_id, 'place_id');
+      const rawMaxPageSize = Math.trunc(this._optionalFiniteNumber(request.max_page_size, 'max_page_size') ?? 10);
+      const maxPageSize = Math.max(1, Math.min(50, rawMaxPageSize));
+      const pageToken = typeof request.page_token === 'string' ? request.page_token : undefined;
+      const response = await this.openCloudClient.listAssetVersions(placeId, maxPageSize, pageToken);
+      const body: Record<string, unknown> = {
+        versions: (response.assetVersions ?? []).map((version) => ({
+          version: this._versionNumberFromPath(version.path),
+          created_at: version.createTime,
+          path: version.path,
+          moderation_state: version.moderationResult?.moderationState,
+        })),
+      };
+      if (response.nextPageToken) body.next_page_token = response.nextPageToken;
+      return this._textResult(body);
+    }
+
+    if (action === 'close' || action === 'status') {
+      await this.managedConnectionAssociations;
+    }
+
+    if (action === 'authorize') {
+      if (!launch_id) throw new Error('manage_instance action=authorize requires launch_id.');
+      const record = await this.instanceManager.authorizeByLaunchId(launch_id);
+      return this._textResult(this._managedStatus(record));
+    }
+
+    if (action === 'complete') {
+      if (!launch_id) throw new Error('manage_instance action=complete requires launch_id.');
+      const record = await this.instanceManager.completeByLaunchId(launch_id);
+      return this._textResult(this._managedStatus(record));
+    }
+
+    if (action === 'status') {
+      if (launch_id) {
+        const record = await this.instanceManager.getByLaunchId(launch_id);
+        if (!record) return this._textResult({ error: 'Launch is not managed.', launch_id });
+        return this._textResult(this._managedStatus(record));
+      }
+      if (instance_id) {
+        const record = await this.instanceManager.get(instance_id);
+        const connected = this.bridge.getPublicPeers().filter((peer) => peer.instanceId === instance_id);
+        if (!record && connected.length === 0) {
+          return this._textResult({ error: 'Instance is not connected or managed.', instance_id });
+        }
+        if (record) return this._textResult(this._managedStatus(record));
+        return this._textResult({
+          instance_id,
+          managed: false,
+          state: 'connected',
+          place_id: connected[0]?.placeId,
+          connected: true,
+          roles: connected.map((instance) => instance.role).sort(),
+        });
+      }
+      return this._textResult({
+        test_worker_job_name: parseStudioTestWorkerJobName(process.env.RSMCP_STUDIO_TEST_WORKER_JOB),
+        managed: (await this.instanceManager.list())
+          .filter((record) => record.closedAt === undefined)
+          .map((record) => this._managedStatus(record)),
+        connected: this.bridge.getPublicInstances().map((instance) => ({
+          instance_id: instance.id,
+          place_id: instance.placeId,
+          place_name: instance.placeName,
+          roles: instance.peers.map((peer) => peer.role).sort(),
+        })),
+      });
+    }
+
+    if (action === 'close') {
+      let record: ManagedStudioInstance | undefined;
+      if (launch_id) {
+        record = await this.instanceManager.getByLaunchId(launch_id);
+        if (!record) return this._textResult({ error: 'Launch is not managed.', launch_id });
+        const connectedInstanceId = record.instanceId;
+        const closeResult = record.closedAt === undefined
+          ? await this.instanceManager.close(record)
+          : { status: 'already_closed' as const };
+        if (connectedInstanceId) {
+          await this.bridge.unregisterInstanceIdEverywhere(connectedInstanceId);
+          await sleep(500);
+          await this.bridge.unregisterInstanceIdEverywhere(connectedInstanceId);
+        }
+        return this._textResult({
+          ...this._managedStatus(record),
+          close_status: closeResult.status,
+          message: closeResult.status === 'already_closed'
+            ? 'Studio instance was already closed.'
+            : 'Studio instance closed.',
+        });
+      }
+      if (instance_id) {
+        const recordBeforeClose = await this.instanceManager.get(instance_id);
+        const managedClose = await this.instanceManager.closeByInstanceId(instance_id);
+        if (managedClose.status !== 'not_found') {
+          await this.bridge.unregisterInstanceIdEverywhere(instance_id);
+          await sleep(500);
+          await this.bridge.unregisterInstanceIdEverywhere(instance_id);
+          const closedRecord = managedClose.launchId
+            ? await this.instanceManager.getByLaunchId(managedClose.launchId)
+            : recordBeforeClose;
+          return this._textResult({
+            ...(closedRecord ? this._managedStatus(closedRecord) : { instance_id }),
+            close_status: managedClose.status,
+            message: managedClose.status === 'already_closed'
+              ? 'Studio instance was already closed.'
+              : 'Studio instance closed.',
+          });
+        }
+
+        const connected = this.bridge.getPublicPeers().filter((peer) => peer.instanceId === instance_id);
+        const edit = connected.find((peer) => peer.role === 'edit');
+        if (!edit) {
+          return this._textResult({
+            error: 'Instance is not connected or managed.',
+            instance_id,
+          });
+        }
+        try {
+          await this.instanceManager.closeConnectedInstance(edit);
+          await sleep(500);
+        } catch (error) {
+          return this._textResult({
+            error: error instanceof Error ? error.message : String(error),
+            instance_id,
+          });
+        }
+        await this.bridge.unregisterInstanceIdEverywhere(instance_id);
+        return this._textResult({
+          instance_id,
+          close_status: 'closed',
+          message: 'Studio instance closed.',
+        });
+      } else {
+        const active = (await this.instanceManager.list()).filter((entry) => entry.closedAt === undefined);
+        if (active.length === 0) {
+          return this._textResult({ message: 'No managed Studio instances are active.' });
+        }
+        if (active.length > 1) {
+          return this._textResult({
+            error: 'instance_id is required because multiple managed Studio instances are active.',
+            managed: active.map((entry) => this._managedStatus(entry)),
+          });
+        }
+        record = active[0];
+      }
+
+      const closeResult = await this.instanceManager.close(record);
+      if (record.instanceId) {
+        await this.bridge.unregisterInstanceIdEverywhere(record.instanceId);
+        await sleep(500);
+        await this.bridge.unregisterInstanceIdEverywhere(record.instanceId);
+      }
+      return this._textResult({
+        ...this._managedStatus(record),
+        close_status: closeResult.status,
+        message: closeResult.status === 'already_closed'
+          ? 'Studio instance was already closed.'
+          : 'Studio instance closed.',
+      });
+    }
+
+    const source = request.source;
+    if (
+      source !== 'baseplate' &&
+      source !== 'local_file' &&
+      source !== 'published_place' &&
+      source !== 'place_revision'
+    ) {
+      throw new Error('manage_instance action=launch requires source=baseplate|local_file|published_place|place_revision');
+    }
+
+    const launchSource = source as StudioLaunchSource;
+    const placeId = launchSource === 'published_place' || launchSource === 'place_revision'
+      ? this._positiveInteger(request.place_id, 'place_id')
+      : undefined;
+    const placeVersion = launchSource === 'place_revision'
+      ? this._positiveInteger(request.place_version, 'place_version')
+      : undefined;
+    const localPlaceFile = typeof request.local_place_file === 'string' ? request.local_place_file : undefined;
+    let studioExecutable: string | undefined;
+    if (request.studio_executable !== undefined) {
+      if (typeof request.studio_executable !== 'string' || request.studio_executable.length === 0) {
+        throw new Error('studio_executable must be a non-empty string when provided.');
+      }
+      studioExecutable = request.studio_executable;
+    }
+    const processEnvironment = parseStudioProcessEnvironmentPatch(request.process_environment);
+    const studioWorkingDirectory = parseStudioWorkingDirectory(request.studio_working_directory);
+
+
+    const universeId = launchSource === 'published_place' || launchSource === 'place_revision'
+      ? await this._deriveUniverseId(placeId as number)
+      : undefined;
+    if (request.require_process_identity !== undefined && typeof request.require_process_identity !== 'boolean') {
+      throw new Error('require_process_identity must be a boolean when provided.');
+    }
+    const requireProcessIdentity = request.require_process_identity === true;
+    const waitForConnection = !requireProcessIdentity && request.wait_for_connection !== false;
+    const timeoutMs = this._optionalPositiveInteger(request.timeout_ms, 'timeout_ms') ?? 120000;
+    const beforeKeys = new Set(this.bridge.getPublicPeers().map((peer) => this._publicInstanceKey(peer)));
+
+    const record = await this.instanceManager.launch({
+      source: launchSource,
+      localPlaceFile,
+      placeId,
+      universeId,
+      placeVersion,
+      connectionTimeoutMs: timeoutMs,
+      studioExecutable,
+      processEnvironment,
+      studioWorkingDirectory,
+      ...(requireProcessIdentity ? { requireProcessIdentity: true } : {}),
+    });
+
+    if (!waitForConnection) {
+      return this._textResult({
+        ...this._managedStatus(record),
+        message: 'Studio launch requested.',
+      });
+    }
+
+    const connected = await this._waitForManagedEditConnection(record, beforeKeys, timeoutMs);
+    if (!connected) {
+      if (record.state === 'launching') {
+        await this.instanceManager.markFailed(record, PLUGIN_CONNECTION_TIMEOUT_REASON);
+      }
+      if (record.closedAt === undefined) {
+        try {
+          await this.instanceManager.close(record);
+        } catch {
+          // Best effort cleanup; the lifecycle error remains the useful result.
+        }
+      }
+      return this._textResult({
+        ...this._managedStatus(record),
+        error: this._managedFailureReason(record) ?? PLUGIN_CONNECTION_TIMEOUT_REASON,
+      });
+    }
+
+    await this.instanceManager.attachInstanceId(record, connected.instanceId);
+    return this._textResult({
+      ...this._managedStatus(record),
+      message: launchSource === 'place_revision'
+        ? `Studio opened place revision ${placeVersion}.`
+        : 'Studio opened.',
+    });
+  }
+
+  async soloPlaytest(
+    action: string,
+    mode?: string,
+    timeout?: number,
+    instance_id?: string,
+    ready_timeout_s?: number,
+    signal?: AbortSignal,
+  ) {
+    if (action !== 'start' && action !== 'stop' && action !== 'status') {
+      throw new Error('solo_playtest requires action=start|stop|status');
+    }
+
+    if (action === 'status') {
+      const refresh = this.bridge.refreshTopologyForRouting();
+      if (refresh) await refresh;
+      const instanceId = this._resolveInstanceIdOnly(instance_id);
+      const { roles, runtimeRoles } = this._briefRoles(instanceId);
+      return this._textResult({
+        success: true,
+        action,
+        running: runtimeRoles.length > 0,
+        roles,
+      });
+    }
+
+    if (action === 'start') {
+      const startMode = mode ?? 'play';
+      if (startMode !== 'play' && startMode !== 'run') {
+        throw new Error('solo_playtest mode must be play or run (default play)');
+      }
+      // The defaulted mode and the effective readiness timeout key the job, so two
+      // different starts never join one another.
+      const readyTimeoutS = ready_timeout_s ?? timeout;
+      return this._withinResponseBudget('solo_playtest', action, [instance_id, startMode, readyTimeoutS], async () => {
+        const body = this._parseTextResult(await this.startPlaytest(startMode, undefined, instance_id, readyTimeoutS, signal));
+        if (body.success === true && body.runtimeReady !== false) {
+          return this._textResult({
+            success: true,
+            action,
+            mode: startMode,
+            message: 'Playtest started; every runtime peer answered an eval.',
+            roles: Array.isArray(body.roles) ? body.roles : undefined,
+            targets: body.targets,
+            elapsedMs: body.elapsedMs,
+          });
+        }
+        return this._textResult({
+          // Keep lifecycle diagnostics on failures; only successful responses are brief.
+          ...body,
+          success: false,
+          action,
+          mode: startMode,
+          error: body.error ?? 'start_failed',
+          message: body.success !== true
+            ? body.message ?? 'Playtest did not start.'
+            : Array.isArray(body.disconnected)
+              ? `Playtest started, but ${body.disconnected.join(', ')} disconnected before answering an eval.`
+              : 'Playtest did not become ready before ready_timeout_s.',
+          roles: Array.isArray(body.roles) ? body.roles : undefined,
+        });
+      });
+    }
+
+    return this._withinResponseBudget('solo_playtest', action, [instance_id, timeout], async () => {
+      const body = this._parseTextResult(await this.stopPlaytest(instance_id, timeout));
+      if (body.success === true && body.runtimeStopped !== false) {
+        return this._textResult({
+          success: true,
+          action,
+          message: 'Playtest stopped.',
+        });
+      }
+      return this._textResult({
+        ...body,
+        success: false,
+        action,
+        error: body.error ?? 'stop_failed',
+        message: body.message ?? 'Playtest did not stop.',
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+        requiresBuiltInMcp: body.requiresBuiltInMcp === true ? true : undefined,
+        recoveryHint: typeof body.recoveryHint === 'string' ? body.recoveryHint : undefined,
+      });
+    });
+  }
+
+  async startPlaytest(
+    mode: string,
+    numPlayers?: number,
+    instance_id?: string,
+    timeout = DEFAULT_PLAYTEST_READY_TIMEOUT_S,
+    signal?: AbortSignal,
+  ) {
+    if (mode !== 'play' && mode !== 'run') {
+      throw new Error('mode must be "play" or "run"');
+    }
+    if (numPlayers !== undefined) {
+      throw new Error('start_playtest is single-player only. Use multiplayer_playtest action="start" for multi-client StudioTestService sessions.');
+    }
+    const data: Record<string, unknown> = { mode };
+    const startedAt = Date.now();
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const resolved = this.bridge.resolveTarget({ instance_id, target: undefined });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+    if (resolved.mode !== 'single') {
+      throw new RoutingFailure({
+        code: 'target_role_not_present_on_instance',
+        message: 'This tool does not support target=all. Pick a specific role or omit target.',
+        data: this._routingErrorData(),
+      });
+    }
+    const existingRuntime = this._runtimeTargetsForScope(resolved.targetInstanceId);
+    if (existingRuntime.length > 0) {
+      const roles = this._rolesForScope(resolved.targetInstanceId);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: 'Playtest already running.',
+            message: 'A playtest is already running for this Studio process scope. Stop the current playtest before starting another.',
+            runtimeReady: true,
+            timedOut: false,
+            roles,
+            runtimeRoles: existingRuntime.map((target) => target.role),
+          }),
+        }],
+      };
+    }
+    const response = await this._requestPeer('/api/start-playtest', data, resolved.targetPeerId);
+    let wait: { ok: boolean; roles: string[]; timedOut: boolean; studioError?: string } | undefined;
+    let readiness: RuntimeEvalReadiness | undefined;
+    if (response?.success === true) {
+      const requiredRoles = mode === 'play' ? ['server', 'client-1'] : ['server'];
+      // Older plugins do not return a testId; they keep the readiness-only wait.
+      const soloStart = typeof response.testId === 'string'
+        ? { editPeerId: resolved.targetPeerId, testId: response.testId }
+        : undefined;
+      wait = await this._waitForRuntimeRolesFresh(resolved.targetInstanceId, startedAt, requiredRoles, timeout, soloStart, signal);
+      if (wait.ok) readiness = await this._waitForRuntimeEval(resolved.targetInstanceId, startedAt + timeout * 1000, signal);
+    }
+    const body = wait?.studioError !== undefined
+      ? {
+        ...response,
+        ...describePlaytestStartFailure(wait.studioError, 'playtest'),
+        success: false,
+        runtimeReady: false,
+        timedOut: false,
+        roles: wait.roles,
+        elapsedMs: Date.now() - startedAt,
+      }
+      : wait
+        ? {
+          ...response,
+          runtimeReady: wait.ok && readiness?.ready === true,
+          timedOut: wait.timedOut || (readiness?.ready === false && readiness.disconnected.length === 0),
+          // Peers can leave during the eval wait; report the scope as it is now.
+          roles: readiness ? this._rolesForScope(resolved.targetInstanceId) : wait.roles,
+          targets: readiness?.targets,
+          notReady: readiness?.ready === false ? readiness.notReady : undefined,
+          ...(readiness?.ready === false
+            ? runtimeEvalFailure(readiness, this._runtimeTargetsForScope(resolved.targetInstanceId).length > 0, 'stop')
+            : {}),
+          elapsedMs: Date.now() - startedAt,
+        }
+        : response;
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(body)
+        }
+      ]
+    };
+  }
+
+  async stopPlaytest(instance_id?: string, timeout = 15) {
+    // The edit DM's stopPlaytest handler writes a plugin:SetSetting request
+    // that StopPlayMonitor reads from inside the play-server DM (the only DM where
+    // StudioTestService:EndTest is legal). The cross-DM signal works independently
+    // of MCP server state, peer-role bookkeeping, or restart cycles.
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const { instanceId } = this._resolveSingleTarget('edit', instance_id);
+    let response: Record<string, unknown>;
+    let stopRequestError: string | undefined;
+    try {
+      response = await this._request('/api/stop-playtest', {}, instanceId, 'edit');
+    } catch (error) {
+      stopRequestError = errorMessage(error);
+      response = {
+        success: false,
+        error: 'Edit stop request failed.',
+        detail: stopRequestError,
+      };
+    }
+    let wait: { ok: boolean; roles: string[]; timedOut: boolean } | undefined;
+    if (response?.success === true) {
+      wait = await this._waitForRuntimeRoles(instanceId, { noRuntime: true }, timeout);
+    } else if (this._runtimeTargetsForScope(instanceId).length > 0) {
+      wait = {
+        ok: false,
+        roles: this._rolesForScope(instanceId),
+        timedOut: response.timedOut === true,
+      };
+    }
+    const body = wait
+      ? {
+        ...response,
+        runtimeStopped: wait.ok,
+        timedOut: wait.timedOut,
+        roles: wait.roles,
+      }
+      : response;
+    if (wait && !wait.ok) {
+      const runtimeRoles = wait.roles.filter((role) => role === 'server' || /^client-\d+$/.test(role));
+      const failureBody = {
+        ...body,
+        success: false,
+        error: 'Playtest teardown did not complete.',
+        message: response.stopSignalAccepted === true && typeof response.message === 'string'
+          ? response.message
+          : response?.success === true
+            ? wait.timedOut
+              ? 'Stop signal was accepted, but runtime peers did not disconnect before timeout.'
+              : 'Stop signal was accepted, but runtime peers are still connected.'
+            : 'Edit stop request failed, and runtime peers are still connected.',
+        stopSignalAccepted: response?.success === true || response.stopSignalAccepted === true,
+        stopRequestError,
+        runtimeRoles,
+        possibleCause:
+          'A game shutdown hook such as BindToClose may be blocking Studio teardown. ' +
+          'No runtime hard-stop or synthetic keyboard fallback was attempted.',
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(failureBody) }],
+      };
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(body) }],
+    };
+  }
+
+  // The client Peers the server plugin still brokers, or undefined from a plugin
+  // that does not report them.
+  private _brokeredClients(serverState: unknown) {
+    if (serverState === null || typeof serverState !== 'object' || !('clients' in serverState)) return undefined;
+    const clients = serverState.clients;
+    if (!Array.isArray(clients)) return undefined;
+    return clients.flatMap((client: unknown) => {
+      if (client === null || typeof client !== 'object' || !('peerId' in client) || typeof client.peerId !== 'string') return [];
+      return [{
+        peerId: client.peerId,
+        role: 'role' in client && typeof client.role === 'string' ? client.role : undefined,
+        playerPresent: !('playerPresent' in client) || client.playerPresent !== false,
+        heartbeatAgeMs: 'heartbeatAgeMs' in client && typeof client.heartbeatAgeMs === 'number' ? client.heartbeatAgeMs : undefined,
+      }];
+    });
+  }
+
+  // The server stops brokering a client as soon as its Player leaves, but the
+  // proxy's disconnect notice can lag or be lost, and the Peer would then linger
+  // until expiry. Drop such clients now. A client that registered after the state
+  // request began can be missing from that snapshot while it joins, so only
+  // clients connected before it count.
+  private async _pruneDepartedClients(
+    instanceId: string,
+    serverState: StudioToolResponse | undefined,
+    requestedAt: number,
+  ): Promise<string[]> {
+    const clients = this._brokeredClients(serverState);
+    const server = this._peerForRoleInScope(instanceId, 'server');
+    if (!clients || !server) return [];
+    const brokered = new Set(clients.filter((client) => client.playerPresent).map((client) => client.peerId));
+    const departed = this.bridge.getPeersInScope(instanceId).filter((peer) =>
+      isClientRole(peer.role) &&
+      peer.transportPeerId === server.transportPeerId &&
+      peer.instanceId !== server.instanceId &&
+      peer.connectedAt < requestedAt &&
+      !brokered.has(peer.peerId));
+    for (const peer of departed) await this.bridge.unregisterInstanceIdEverywhere(peer.instanceId);
+    return departed.map((peer) => peer.peerId);
+  }
+
+  // After a failed leave request, asks the server whether the client's Player is
+  // still there; if not, forgets the client so the role does not linger.
+  private async _clientAlreadyLeft(scopeInstanceId: string, clientPeerId: string): Promise<boolean> {
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const peer = this.bridge.getPeersInScope(scopeInstanceId).find((candidate) => candidate.peerId === clientPeerId);
+    if (!peer) return true;
+    const server = this._peerForRoleInScope(scopeInstanceId, 'server');
+    if (!server || server.instanceId === peer.instanceId || server.transportPeerId !== peer.transportPeerId) return false;
+    let serverState: StudioToolResponse;
+    try {
+      serverState = await this._requestPeer('/api/multiplayer-test-state', {}, server.peerId, 5000);
+    } catch {
+      return false;
+    }
+    const clients = this._brokeredClients(serverState);
+    if (!clients || clients.some((entry) => entry.peerId === clientPeerId && entry.playerPresent)) return false;
+    await this.bridge.unregisterInstanceIdEverywhere(peer.instanceId);
+    return true;
+  }
+
+  private async _buildMultiplayerState(instanceId: string): Promise<Record<string, unknown>> {
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const peers = this.bridge.getPublicPeers()
+      .filter((peer) => this.bridge.getInstanceIdsInScope(instanceId).includes(peer.instanceId))
+      .sort((a, b) => a.role.localeCompare(b.role));
+    const multiplayerGroup = this.bridge.getMultiplayerGroups().find((group) =>
+      group.instanceIds.includes(instanceId)
+    );
+
+    const body: Record<string, unknown> = {
+      instanceId,
+      multiplayerGroupId: multiplayerGroup?.id,
+      peers,
+      peerCount: peers.length,
+    };
+
+    const edit = peers.find((p) => p.role === 'edit');
+    const server = peers.find((p) => p.role === 'server');
+
+    let editState: StudioToolResponse | undefined;
+    let serverState: StudioToolResponse | undefined;
+
+    if (edit) {
+      try {
+        editState = await this._request('/api/multiplayer-test-state', {}, instanceId, 'edit');
+        body.edit = editState;
+      } catch (err) {
+        body.edit = { error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    if (server) {
+      const requestedAt = Date.now();
+      try {
+        serverState = await this._request('/api/multiplayer-test-state', {}, instanceId, 'server');
+        body.server = serverState;
+      } catch (err) {
+        body.server = { error: err instanceof Error ? err.message : String(err) };
+      }
+      const departed = await this._pruneDepartedClients(instanceId, serverState, requestedAt);
+      if (departed.length > 0) {
+        const remaining = peers.filter((peer) => !departed.includes(peer.peerId));
+        body.peers = remaining;
+        body.peerCount = remaining.length;
+      }
+    }
+
+    const session = editState?.session;
+    const rawPhase = typeof session?.phase === 'string' ? session.phase : undefined;
+    const hasRuntime = peers.some((p) => p.role === 'server' || p.role.startsWith('client-'));
+    body.phase = rawPhase === 'starting' && hasRuntime ? 'running' : (rawPhase ?? (hasRuntime ? 'running' : 'idle'));
+    body.testId = session?.testId;
+    body.numPlayers = session?.numPlayers;
+    body.testArgs = session?.testArgs ?? serverState?.testArgs;
+    body.result = session?.result;
+    body.error = session?.error;
+    body.players = serverState?.players ?? [];
+    body.playerCount = serverState?.playerCount ?? 0;
+    body.clientRoles = this._clientRolesForScope(instanceId);
+
+    return body;
+  }
+
+  private async _waitForMultiplayerEditDone(instanceId: string, timeoutSec = 30): Promise<boolean> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    while (Date.now() < deadline) {
+      const refresh = this.bridge.refreshTopologyForRouting();
+      if (refresh) await refresh;
+      if (!this._rolesForScope(instanceId).includes('edit')) return false;
+      try {
+        const editState = await this._request('/api/multiplayer-test-state', {}, instanceId, 'edit');
+        const phase = editState?.session?.phase;
+        if (phase === 'completed' || phase === 'failed') return true;
+      } catch {
+        // The edit peer may be temporarily busy while Studio tears down.
+      }
+      await sleep(250);
+    }
+    return false;
+  }
+
+  private async _isMultiplayerTestRunning(instanceId: string): Promise<boolean> {
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    return this.bridge.getMultiplayerGroups().some((group) =>
+      group.instanceIds.includes(instanceId)
+    );
+  }
+
+  private async _waitForMultiplayerStart(
+    instanceId: string,
+    clientCount: number,
+    timeoutSec = 30,
+    connectedAfter?: number,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; roles: string[]; timedOut: boolean; phase?: string; error?: unknown }> {
+    const deadline = Date.now() + timeoutSec * 1000;
+    let lastPhase: string | undefined;
+    while (Date.now() < deadline) {
+      const exact = await this._waitForExactClientCount(instanceId, clientCount, 0.25, 0);
+      if (exact.ok || exact.extraClients) {
+        if (exact.ok && connectedAfter !== undefined) {
+          const peers = this.bridge.getPeersInScope(instanceId);
+          const freshRoles = new Set(peers.filter((peer) => peer.connectedAt >= connectedAfter).map((peer) => peer.role));
+          const freshClientCount = [...freshRoles].filter((role) => /^client-\d+$/.test(role)).length;
+          if (!freshRoles.has('server') || freshClientCount !== clientCount) {
+            await sleep(250, signal);
+            continue;
+          }
+        }
+        return { ok: exact.ok, roles: exact.roles, timedOut: false, error: exact.extraClients ? `Expected ${clientCount} client(s), but Studio registered ${exact.clientCount}.` : undefined };
+      }
+      try {
+        const remainingMs = Math.max(1, Math.min(1000, deadline - Date.now()));
+        const editState = await this._request('/api/multiplayer-test-state', {}, instanceId, 'edit', remainingMs, signal);
+        const session = editState?.session;
+        if (typeof session?.phase === 'string') {
+          lastPhase = session.phase;
+        }
+        if (session?.phase === 'failed') {
+          return { ok: false, roles: this._rolesForScope(instanceId), timedOut: false, phase: session.phase, error: session.error };
+        }
+      } catch {
+        // Keep waiting; normal startup is driven by runtime peers registering.
+      }
+      await sleep(250, signal);
+    }
+    return { ok: false, roles: this._rolesForScope(instanceId), timedOut: true, phase: lastPhase };
+  }
+
+  async multiplayerPlaytest(
+    action: string,
+    numPlayers?: number,
+    target?: string,
+    testArgs?: unknown,
+    value?: unknown,
+    timeout?: number,
+    instance_id?: string,
+    ready_timeout_s?: number,
+    signal?: AbortSignal,
+  ) {
+    if (
+      action !== 'start' &&
+      action !== 'status' &&
+      action !== 'add_players' &&
+      action !== 'leave_client' &&
+      action !== 'end'
+    ) {
+      throw new Error('multiplayer_playtest requires action=start|status|add_players|leave_client|end');
+    }
+
+    const briefState = async (instanceId?: string) => {
+      const refresh = this.bridge.refreshTopologyForRouting();
+      if (refresh) await refresh;
+      const state = await this._buildMultiplayerState(this._resolveInstanceIdOnly(instanceId));
+      const roles = Array.isArray(state.peers)
+        ? state.peers.flatMap((peer) =>
+            peer !== null && typeof peer === 'object' && 'role' in peer && typeof peer.role === 'string'
+              ? [peer.role]
+              : [])
+        : [];
+      // The server reports each client's bridge heartbeat age; a silent bridge
+      // usually means the client's Studio process is gone, while its Player
+      // stays on the server until the engine's connection timeout.
+      const unresponsiveClients = (this._brokeredClients(state.server) ?? []).flatMap((client) =>
+        client.playerPresent && client.role !== undefined && roles.includes(client.role) &&
+        (client.heartbeatAgeMs ?? 0) > CLIENT_BRIDGE_STALE_MS
+          ? [client.role]
+          : []);
+      return {
+        phase: state.phase,
+        multiplayerGroupId: typeof state.multiplayerGroupId === 'string' ? state.multiplayerGroupId : undefined,
+        roles,
+        playerCount: typeof state.playerCount === 'number' ? state.playerCount : undefined,
+        error: typeof state.error === 'string' ? state.error : undefined,
+        ...(unresponsiveClients.length > 0 ? {
+          unresponsiveClients,
+          hint: 'These clients\' MCP bridges sent no heartbeat for over 10 s: their Studio process may have exited or be frozen. leave_client removes them.',
+        } : {}),
+      };
+    };
+
+    if (action === 'status') {
+      return this._textResult({
+        success: true,
+        action,
+        ...(await briefState(instance_id)),
+      });
+    }
+
+    return this._withinResponseBudget(
+      'multiplayer_playtest', action, [instance_id, numPlayers, target, testArgs, value, timeout, ready_timeout_s],
+      () => this._multiplayerPlaytestAction(action, numPlayers, target, testArgs, value, timeout, instance_id, ready_timeout_s, signal),
+    );
+  }
+
+  // start, add_players, leave_client and end, run under the response budget.
+  private async _multiplayerPlaytestAction(
+    action: string,
+    numPlayers: number | undefined,
+    target: string | undefined,
+    testArgs: unknown,
+    value: unknown,
+    timeout: number | undefined,
+    instance_id: string | undefined,
+    ready_timeout_s: number | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<ToolCallResult> {
+    if (action === 'start') {
+      const body = this._parseTextResult(await this.multiplayerTestStart(numPlayers as number, testArgs, ready_timeout_s ?? timeout, instance_id, signal));
+      const stateValue = body.state;
+      const state: Record<string, unknown> = stateValue !== null && typeof stateValue === 'object' && !Array.isArray(stateValue)
+        ? { ...stateValue }
+        : {};
+      const waitValue = body.wait;
+      const wait: Record<string, unknown> = waitValue !== null && typeof waitValue === 'object' && !Array.isArray(waitValue)
+        ? { ...waitValue }
+        : {};
+      const launched = body.success === true && body.ready === true;
+      const multiplayerGroupId = typeof body.multiplayerGroupId === 'string'
+        ? body.multiplayerGroupId
+        : typeof body.testId === 'string'
+          ? body.testId
+          : undefined;
+      return this._textResult(launched ? {
+        success: true,
+        action,
+        message: 'Multiplayer playtest started; every runtime peer answered an eval.',
+        multiplayerGroupId,
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+        targets: body.targets,
+        playerCount: typeof state.playerCount === 'number' ? state.playerCount : undefined,
+        elapsedMs: body.elapsedMs,
+      } : {
+        success: false,
+        action,
+        error: body.error ?? wait.error ?? 'multiplayer_start_not_detected',
+        message: body.success === true
+          ? 'Multiplayer playtest start was requested, but MCP did not detect the required server/client peers before timeout.'
+          : body.message ?? 'Multiplayer playtest did not start.',
+        multiplayerGroupId,
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+        notReady: body.notReady,
+        running: typeof body.running === 'boolean' ? body.running : undefined,
+        elapsedMs: body.elapsedMs,
+        studioError: typeof body.studioError === 'string' ? body.studioError : undefined,
+        recoveryHint: typeof body.recoveryHint === 'string' ? body.recoveryHint : undefined,
+      });
+    }
+
+    if (action === 'add_players') {
+      const body = this._parseTextResult(await this.multiplayerTestAddPlayers(numPlayers as number, timeout, instance_id));
+      const stateValue = body.state;
+      const state: Record<string, unknown> = stateValue !== null && typeof stateValue === 'object' && !Array.isArray(stateValue)
+        ? { ...stateValue }
+        : {};
+      const success = body.success === true && body.ready === true;
+      return this._textResult(success ? {
+        success: true,
+        action,
+        message: 'Players added.',
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+        playerCount: typeof state.playerCount === 'number' ? state.playerCount : undefined,
+      } : {
+        success: false,
+        action,
+        error: body.error ?? 'add_players_failed',
+        message: body.success === true
+          ? 'Players did not finish joining before timeout.'
+          : body.message ?? 'Players were not added.',
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+      });
+    }
+
+    if (action === 'leave_client') {
+      const body = this._parseTextResult(await this.multiplayerTestLeaveClient(target, timeout, instance_id));
+      return this._textResult(body.success === true && body.left === true ? {
+        success: true,
+        action,
+        message: typeof body.message === 'string' && (body.alreadyLeft === true || body.removedByServer === true)
+          ? body.message
+          : 'Client left.',
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+      } : {
+        success: false,
+        action,
+        error: body.error ?? 'leave_client_failed',
+        message: body.message ?? 'Client did not leave.',
+        roles: Array.isArray(body.roles) ? body.roles : undefined,
+      });
+    }
+
+    const body = this._parseTextResult(await this.multiplayerTestEnd(value, timeout, instance_id));
+    const multiplayerGroupId = typeof body.multiplayerGroupId === 'string'
+      ? body.multiplayerGroupId
+      : undefined;
+    return this._textResult(body.success === true && body.ended === true ? {
+      success: true,
+      action,
+      multiplayerGroupId,
+      message: body.alreadyEnded === true
+        ? 'Multiplayer playtest already ended.'
+        : (body.teardownConfirmed === false
+          ? 'Multiplayer playtest end requested; teardown still in progress. Use multiplayer_playtest action="status" to confirm.'
+          : 'Multiplayer playtest ended.'),
+      teardownConfirmed: body.teardownConfirmed === true,
+    } : {
+      success: false,
+      action,
+      multiplayerGroupId,
+      error: body.error ?? 'end_failed',
+      message: body.message ?? 'Multiplayer playtest did not end.',
+      roles: Array.isArray(body.roles) ? body.roles : undefined,
+      editDone: body.editDone === false ? false : undefined,
+    });
+  }
+
+  async multiplayerTestStart(numPlayers: number, testArgs?: unknown, timeout?: number, instance_id?: string, signal?: AbortSignal) {
+    if (!Number.isInteger(numPlayers) || numPlayers < 1 || numPlayers > 8) {
+      throw new Error('numPlayers must be an integer from 1 to 8');
+    }
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const editTarget = this._resolveSingleTarget('edit', instance_id);
+    const existingRuntime = this._runtimeTargetsForScope(editTarget.instanceId);
+    if (existingRuntime.length > 0) {
+      const roles = this._rolesForScope(editTarget.instanceId);
+      return this._textResult({
+        success: false,
+        error: 'Multiplayer playtest already running.',
+        message: 'A Studio runtime is already connected for this process scope. End the existing playtest before starting another multiplayer playtest.',
+        ready: true,
+        timedOut: false,
+        roles,
+        runtimeRoles: existingRuntime.map((target) => target.role),
+      });
+    }
+
+    const startedAt = Date.now();
+    const response = await this._requestPeer(
+      '/api/multiplayer-test-start',
+      { numPlayers, testArgs: testArgs ?? {} },
+      editTarget.targetPeerId,
+    );
+    const groupId = typeof response?.testId === 'string' ? response.testId : undefined;
+    if (response?.error || response?.success !== true || groupId === undefined) {
+      if (groupId !== undefined) await this.bridge.removeMultiplayerGroupEverywhere(groupId);
+      return this._textResult({
+        ...response,
+        error: response?.error ?? 'Multiplayer start did not return a testId.',
+      });
+    }
+
+    await this.bridge.createMultiplayerGroupEverywhere(groupId, editTarget.instanceId);
+    const readyTimeoutS = timeout ?? DEFAULT_PLAYTEST_READY_TIMEOUT_S;
+    const wait = await this._waitForMultiplayerStart(editTarget.instanceId, numPlayers, readyTimeoutS, startedAt, signal);
+    const launched = wait.ok;
+    const readiness = wait.ok
+      ? await this._waitForRuntimeEval(editTarget.instanceId, startedAt + readyTimeoutS * 1000, signal)
+      : undefined;
+    const state = await this._buildMultiplayerState(editTarget.instanceId);
+    const success = wait.ok && readiness?.ready === true;
+    const runtimeStillConnected = this._runtimeTargetsForScope(editTarget.instanceId).length > 0;
+    const definitelyFailed = state.phase === 'failed' && !runtimeStillConnected;
+    if (definitelyFailed) await this.bridge.removeMultiplayerGroupEverywhere(groupId);
+    // Studio refused the start (its async call failed); keep its error rather than blame peer detection.
+    const startFailure = !success && wait.phase === 'failed'
+      ? describePlaytestStartFailure(
+        typeof wait.error === 'string' ? wait.error : String(wait.error ?? 'unknown error'),
+        'multiplayer playtest',
+      )
+      : undefined;
+    const evalFailure = readiness?.ready === false ? runtimeEvalFailure(readiness, runtimeStillConnected, 'end') : undefined;
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          ...response,
+          multiplayerGroupId: groupId,
+          success,
+          ready: success,
+          launched,
+          startRequested: true,
+          timedOut: wait.timedOut || (readiness?.ready === false && readiness.disconnected.length === 0),
+          wait,
+          // Peers can leave during the eval wait; report the scope as it is now.
+          roles: readiness ? this._rolesForScope(editTarget.instanceId) : wait.roles,
+          targets: readiness?.targets,
+          notReady: readiness?.ready === false ? readiness.notReady : undefined,
+          running: evalFailure?.running,
+          disconnected: evalFailure?.disconnected,
+          state,
+          error: success
+            ? undefined
+            : startFailure?.error ?? (readiness?.ready === false ? 'runtime_eval_not_ready' : wait.error ?? 'multiplayer_start_not_detected'),
+          message: success
+            ? 'Multiplayer Studio test started and every runtime peer answered an eval.'
+            : startFailure?.message ?? (evalFailure?.disconnected
+              ? `Multiplayer Studio test started, but ${evalFailure.disconnected.join(', ')} disconnected before answering an eval.`
+              : evalFailure
+                ? 'Multiplayer Studio test started, but some runtime peers did not answer an eval before ready_timeout_s.'
+                : 'Multiplayer Studio test start was requested, but MCP did not detect the required server/client peers before timeout.'),
+          studioError: startFailure?.studioError,
+          recoveryHint: startFailure?.recoveryHint ?? evalFailure?.recoveryHint,
+          elapsedMs: Date.now() - startedAt,
+          startedAt,
+        }),
+      }],
+    };
+  }
+
+  async multiplayerTestState(instance_id?: string) {
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const instanceId = this._resolveInstanceIdOnly(instance_id);
+    const state = await this._buildMultiplayerState(instanceId);
+    return { content: [{ type: 'text', text: JSON.stringify(state) }] };
+  }
+
+  async multiplayerTestAddPlayers(numPlayers: number, timeout?: number, instance_id?: string) {
+    if (!Number.isInteger(numPlayers) || numPlayers < 1 || numPlayers > 8) {
+      throw new Error('numPlayers must be an integer from 1 to 8');
+    }
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const serverTarget = this._resolveSingleTarget('server', instance_id);
+    const group = this.bridge.getMultiplayerGroups().find((candidate) =>
+      candidate.instanceIds.includes(serverTarget.instanceId)
+    );
+    const scopeInstanceId = group?.controllerInstanceId ?? serverTarget.instanceId;
+    const before = this._clientRolesForScope(scopeInstanceId).length;
+    const response = await this._requestPeer(
+      '/api/multiplayer-test-add-players',
+      { numPlayers, timeout: timeout ?? 10 },
+      serverTarget.targetPeerId,
+    );
+    if (response?.error) {
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    }
+    const wait = await this._waitForExactClientCount(
+      scopeInstanceId,
+      before + numPlayers,
+      timeout ?? 30,
+    );
+    const state = await this._buildMultiplayerState(scopeInstanceId);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          ...response,
+          ready: wait.ok,
+          timedOut: wait.timedOut,
+          wait,
+          roles: wait.roles,
+          state,
+        }),
+      }],
+    };
+  }
+
+  async multiplayerTestLeaveClient(target?: string, timeout?: number, instance_id?: string) {
+    if (target && !/^client-\d+$/.test(target)) {
+      throw new Error(`multiplayer_test_leave_client requires target=client-N (got: ${target})`);
+    }
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const role = this._targetForInstanceId(instance_id, { requested: target, fallback: 'client-1', accepts: isClientRole });
+    const clientTarget = this._resolveSingleTarget(role, instance_id);
+    const group = this.bridge.getMultiplayerGroups().find((candidate) =>
+      candidate.instanceIds.includes(clientTarget.instanceId)
+    );
+    const scopeInstanceId = group?.controllerInstanceId ?? clientTarget.instanceId;
+    let response: StudioToolResponse | undefined;
+    let requestFailed = false;
+    let requestError: unknown;
+    try {
+      response = await this._requestPeer(
+        '/api/multiplayer-test-leave-client',
+        {},
+        clientTarget.targetPeerId,
+      );
+    } catch (error) {
+      // The client's proxy can disconnect while the request is pending.
+      requestFailed = true;
+      requestError = error;
+    }
+    if (requestFailed || response?.error) {
+      // A client whose Player already left cannot answer; that is not a failure to leave.
+      if (await this._clientAlreadyLeft(scopeInstanceId, clientTarget.targetPeerId)) {
+        return this._textResult({
+          success: true,
+          left: true,
+          alreadyLeft: true,
+          message: `${clientTarget.role} had already left (its Player is no longer in the server); removed it.`,
+          roles: this._rolesForScope(scopeInstanceId),
+          state: await this._buildMultiplayerState(scopeInstanceId),
+        });
+      }
+      if (requestFailed) throw requestError;
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    }
+    const wait = await this._waitForRuntimeRoles(
+      scopeInstanceId,
+      { absentRole: clientTarget.role },
+      timeout ?? 30,
+    );
+    const state = await this._buildMultiplayerState(scopeInstanceId);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          ...response,
+          left: wait.ok,
+          timedOut: wait.timedOut,
+          roles: wait.roles,
+          state,
+        }),
+      }],
+    };
+  }
+
+  async multiplayerTestEnd(value?: unknown, timeout?: number, instance_id?: string) {
+    // A refresh failure must not be mistaken for an already-ended playtest.
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    let serverTarget: { targetPeerId: string; instanceId: string; role: string };
+    try {
+      serverTarget = this._resolveSingleTarget('server', instance_id);
+    } catch (error) {
+      const instanceId = this._resolveInstanceIdOnly(instance_id);
+      const group = this.bridge.getMultiplayerGroups().find((candidate) =>
+        candidate.instanceIds.includes(instanceId)
+      );
+      const hasRuntime = this._rolesForScope(instanceId).some(
+        (role) => role === 'server' || /^client-\d+$/.test(role),
+      );
+      if (!hasRuntime) {
+        if (group) await this.bridge.removeMultiplayerGroupEverywhere(group.id);
+        return this._textResult({
+          success: true,
+          multiplayerGroupId: group?.id,
+          ended: true,
+          alreadyEnded: true,
+          teardownConfirmed: true,
+          message: 'No active multiplayer test to end (already ended).',
+        });
+      }
+      throw error;
+    }
+
+    const group = this.bridge.getMultiplayerGroups().find((candidate) =>
+      candidate.instanceIds.includes(serverTarget.instanceId)
+    );
+    const scopeInstanceId = group?.controllerInstanceId ?? serverTarget.instanceId;
+    const response = await this._requestPeer(
+      '/api/multiplayer-test-end',
+      { value: value ?? 'ended_by_mcp' },
+      serverTarget.targetPeerId,
+    );
+    if (response?.error) {
+      return this._textResult({
+        ...response,
+        multiplayerGroupId: group?.id,
+      });
+    }
+    const editDone = await this._waitForMultiplayerEditDone(scopeInstanceId, timeout ?? 30);
+    const wait = await this._waitForRuntimeRoles(
+      scopeInstanceId,
+      { noRuntime: true },
+      timeout ?? 30,
+    );
+    const state = await this._buildMultiplayerState(scopeInstanceId);
+    const result = this._textResult({
+      ...response,
+      multiplayerGroupId: group?.id,
+      ended: response.success === true,
+      teardownConfirmed: wait.ok,
+      editDone,
+      timedOut: wait.timedOut,
+      roles: wait.roles,
+      state,
+    });
+    if (wait.ok && group) await this.bridge.removeMultiplayerGroupEverywhere(group.id);
+    return result;
+  }
+
+  async getConnectedInstances() {
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const rejectedInstances = this.bridge.getVersionRejections().map((rejection) => ({
+      instanceId: rejection.instanceId,
+      role: rejection.role,
+      placeName: rejection.placeName,
+      pluginVersion: rejection.pluginVersion,
+      pluginVariant: rejection.pluginVariant,
+      serverVersion: rejection.serverVersion,
+      rejectedAt: new Date(rejection.rejectedAt).toISOString(),
+      hint: rejection.hint,
+    }));
+    return this._textResult({
+      instances: this.bridge.getConnectedInstances(),
+      multiplayerGroups: this.bridge.getConnectedMultiplayerGroups(),
+      ...(rejectedInstances.length > 0 ? { rejectedInstances } : {}),
+    });
+  }
+
+  async getRequestStatus(request_id: string, wait_ms?: number, signal?: AbortSignal) {
+    if (!isValidOperationId(request_id)) {
+      throw new Error(`request_id must contain between 1 and ${MAX_OPERATION_ID_LENGTH} characters`);
+    }
+    if (wait_ms !== undefined && (!Number.isInteger(wait_ms) || wait_ms < 0 || wait_ms > MAX_OPERATION_WAIT_MS)) {
+      throw new Error(`wait_ms must be an integer from 0 to ${MAX_OPERATION_WAIT_MS}`);
+    }
+    // One status call must also answer inside the client's timeout, so a longer
+    // wait_ms is cut to the response budget; waitCappedMs reports the wait used.
+    const waitMs = Math.min(wait_ms ?? 0, responseBudgetMs());
+    const capped = wait_ms !== undefined && wait_ms > waitMs ? { waitCappedMs: waitMs } : {};
+    const job = this.toolJobs.get(request_id);
+    if (job) {
+      const outcome = await this._awaitToolJob(job, waitMs, signal);
+      if (!outcome) return this._textResult({ ...this._toolJobPending(job), ...capped });
+      const status = {
+        requestId: job.id,
+        state: 'settled',
+        tool: job.tool,
+        action: job.action,
+        elapsedMs: (job.settledAt ?? Date.now()) - job.startedAt,
+      };
+      // One JSON item with the result nested: MCP clients read success, error and
+      // structuredContent from the first JSON text item, so a collected result
+      // must flag a failure the same way the direct call would have.
+      if ('error' in outcome) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ...publicToolErrorBody(job.tool, outcome.error), ...status, outcome: 'error' }) }], isError: true };
+      }
+      const text = outcome.result.content.find((item) => item.type === 'text')?.text;
+      let result: unknown = text;
+      try {
+        if (text !== undefined) result = JSON.parse(text);
+      } catch {
+        // Not JSON: return the text as it is.
+      }
+      const inner = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : {};
+      const failed = inner.success === false || (typeof inner.error === 'string' && inner.error.length > 0);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ ...status, outcome: 'result', result }) }],
+        ...(failed ? { isError: true } : {}),
+      };
+    }
+    const deadline = Date.now() + waitMs;
+    // A generate_model job may still be preparing its reference image here,
+    // before the bridge holds any record of it.
+    if (this.referenceUploads.view(request_id)) {
+      await this.referenceUploads.waitForPreparation(request_id, waitMs, signal);
+      const preparation = this.referenceUploads.view(request_id);
+      if (preparation && preparation.stage !== 'dispatched') {
+        return this._textResult({ ...this._preparationStatus(request_id, preparation), ...capped });
+      }
+    }
+    const remainingMs = Math.max(0, deadline - Date.now());
+    return this._operationStatusResult(request_id, await this.bridge.getRequestStatusEverywhere(request_id, remainingMs, signal), capped);
+  }
+
+  private _requestStatusResult(requestId: string, status: RequestStatus | undefined, extra: Record<string, unknown> = {}) {
+    return this._textResult(status ? { ...status, ...extra } : { ...unretainedStatus(requestId), ...extra });
+  }
+
+  // A bridge status, plus the reference-image preparation and an overall phase
+  // when this server prepared the operation for generate_model.
+  private _operationStatusResult(requestId: string, status: RequestStatus | undefined, extra: Record<string, unknown> = {}) {
+    const preparation = this.referenceUploads.view(requestId);
+    if (!preparation) return this._requestStatusResult(requestId, status, extra);
+    if (!status) return this._textResult({ ...unretainedStatus(requestId), preparation, ...extra });
+    return this._textResult({ ...status, phase: generationPhase(status), preparation, ...extra });
+  }
+
+  // A generate_model job that has not reached the bridge, shaped like a request
+  // status. Its generation has not been sent, so it has not executed.
+  private _preparationStatus(requestId: string, preparation: ReferenceUploadView): Record<string, unknown> {
+    const failed = preparation.stage === 'upload_failed' || preparation.stage === 'upload_unknown' || preparation.error !== undefined;
+    return {
+      requestId,
+      targetPeerId: preparation.targetPeerId,
+      queuedAt: preparation.startedAt,
+      phase: failed ? 'failed' : preparation.stage === 'uploading' ? 'uploading' : 'preparing',
+      stage: 'preparing',
+      state: failed ? 'settled' : 'pending',
+      outcome: failed ? 'error' : 'pending',
+      executionOutcome: 'not_executed',
+      preparation,
+    };
+  }
+
+
+  // === Asset Tools ===
+
+  async searchAssets(
+    assetType: string,
+    query?: string,
+    maxResults?: number,
+    sortBy?: string,
+    robloxCreatedOnly?: boolean
+  ) {
+    const normalized = normalizeCreatorStoreSearch(assetType, query);
+    if (maxResults !== undefined && (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 100)) {
+      throw new Error('search_assets maxResults must be an integer from 1 to 100');
+    }
+    if (sortBy !== undefined && !CREATOR_STORE_SORT_CATEGORIES.has(sortBy)) {
+      throw new Error(
+        `search_assets sortBy must be one of: ${Array.from(CREATOR_STORE_SORT_CATEGORIES).join(', ')}`,
+      );
+    }
+
+    const response = await this.openCloudClient.searchAssets({
+      searchCategoryType: normalized.searchCategoryType,
+      query: normalized.effectiveQuery,
+      maxPageSize: maxResults,
+      sortCategory: sortBy as AssetSearchParams['sortCategory'],
+      ...(robloxCreatedOnly ? { userId: ROBLOX_CREATOR_USER_ID } : {}),
+    });
+
+    const results = response.creatorStoreAssets.flatMap((entry) => {
+      const asset = entry.asset;
+      if (!asset || !Number.isSafeInteger(asset.id) || asset.id <= 0) return [];
+      const result: Record<string, unknown> = {
+        assetId: asset.id,
+        name: asset.name,
+        description: normalizeSearchAssetDescription(asset.description),
+      };
+      if (
+        typeof asset.durationSeconds === 'number'
+        && Number.isFinite(asset.durationSeconds)
+      ) {
+        result.duration = asset.durationSeconds;
+      }
+      return [result];
+    });
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          assetType: normalized.requestedAssetType,
+          query: normalized.effectiveQuery ?? '',
+          ...(normalized.searchCategoryType !== normalized.requestedAssetType
+            ? { searchedAs: normalized.searchCategoryType }
+            : {}),
+          totalResults: response.totalResults,
+          results,
+        })
+      }]
+    };
+  }
+
+  async getAssetDetails(assetId: number) {
+    if (!assetId) {
+      throw new Error('Asset ID is required for get_asset_details');
+    }
+
+    const response = await this.openCloudClient.getAssetDetails(assetId);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(response)
+      }]
+    };
+  }
+
+  async getAssetThumbnail(assetId: number, size?: string) {
+    if (!assetId) {
+      throw new Error('Asset ID is required for get_asset_thumbnail');
+    }
+    const result = await this.openCloudClient.getAssetThumbnail(assetId, size as any);
+    if (!result) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ error: 'Thumbnail not available for this asset' })
+        }]
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ assetId, mimeType: result.mimeType }),
+        },
+        {
+          type: 'image',
+          data: result.base64,
+          mimeType: result.mimeType,
+        },
+      ]
+    };
+  }
+
+  async insertAsset(
+    assetId: number,
+    parentPath?: string,
+    position?: { x: number; y: number; z: number },
+    instance_id?: string,
+    operation_id?: string,
+  ) {
+    if (!assetId) {
+      throw new Error('Asset ID is required for insert_asset');
+    }
+    const response = await this._callSingle('/api/insert-asset', {
+      assetId,
+      parentPath: parentPath || 'game.Workspace',
+      position
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(response)
+      }]
+    };
+  }
+
+  async generateModel(request: Record<string, unknown> = {}, instance_id?: string) {
+    try {
+      return await this._generateModel(request, instance_id);
+    } catch (error) {
+      // Structured failures keep their code and recovery fields (request ID,
+      // stage, outcome) for the shared error formatter; only plain validation
+      // errors are reported inline.
+      if (
+        error instanceof RoutingFailure
+        || error instanceof RequestFailure
+        || error instanceof StudioOperationError
+        || error instanceof OpenCloudOperationError
+        || error instanceof ReferenceUploadError
+        || error instanceof MultiplayerGroupInUseError
+      ) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: false, error: message }),
+        }],
+      };
+    }
+  }
+
+  private async _generateModel(request: Record<string, unknown> = {}, instance_id?: string) {
+    const prompt = typeof request.prompt === 'string' && request.prompt.trim() !== ''
+      ? request.prompt
+      : undefined;
+    const imagePath = typeof request.image_path === 'string' && request.image_path !== ''
+      ? request.image_path
+      : undefined;
+    const imageBase64 = typeof request.image_base64 === 'string' && request.image_base64 !== ''
+      ? request.image_base64
+      : undefined;
+    const imageAssetId = typeof request.image_asset_id === 'number' && Number.isFinite(request.image_asset_id)
+      ? Math.trunc(request.image_asset_id)
+      : undefined;
+
+    const imageSourceCount = [imagePath, imageBase64, imageAssetId].filter((value) => value !== undefined).length;
+    if (!prompt && imageSourceCount === 0) {
+      throw new Error('generate_model requires prompt, image_path, image_base64, or image_asset_id.');
+    }
+    if (imageSourceCount > 1) {
+      throw new Error('generate_model accepts only one image source: image_path, image_base64, or image_asset_id.');
+    }
+
+    const schema = typeof request.schema === 'string' && request.schema !== ''
+      ? request.schema
+      : undefined;
+    const schemaGroups = Array.isArray(request.schema_groups) ? request.schema_groups : undefined;
+    if (schema && schemaGroups) {
+      throw new Error('schema and schema_groups are mutually exclusive.');
+    }
+    if (schema && schema !== 'Body1' && schema !== 'Car5') {
+      throw new Error('schema must be Body1 or Car5.');
+    }
+    if (schemaGroups) {
+      if (schemaGroups.length === 0 || !schemaGroups.every((entry) => typeof entry === 'string' && entry.trim() !== '')) {
+        throw new Error('schema_groups must be a non-empty array of strings.');
+      }
+    }
+
+    const size = request.size;
+    let modelSize: { x: number; y: number; z: number } | undefined;
+    if (size !== undefined) {
+      if (!size || typeof size !== 'object' || Array.isArray(size)) {
+        throw new Error('size must be an object with positive x, y, and z numbers.');
+      }
+      const rawSize = size as Record<string, unknown>;
+      const x = rawSize.x;
+      const y = rawSize.y;
+      const z = rawSize.z;
+      if (typeof x !== 'number' || typeof y !== 'number' || typeof z !== 'number' || x <= 0 || y <= 0 || z <= 0) {
+        throw new Error('size must be an object with positive x, y, and z numbers.');
+      }
+      modelSize = { x, y, z };
+    }
+
+    let referencePng: Buffer | undefined;
+    let image: GenerateModelImage | undefined;
+    if (imagePath) {
+      const decoded = decodeImagePathToRgba(imagePath);
+      referencePng = rgbaToPng(decoded.rgba, decoded.width, decoded.height);
+    } else if (imageBase64) {
+      const imageMimeType = request.image_mime_type;
+      if (imageMimeType !== 'image/png') {
+        throw new Error('image_mime_type must be "image/png" when image_base64 is provided.');
+      }
+      const decoded = decodePngBase64ToRgba(imageBase64);
+      referencePng = rgbaToPng(decoded.rgba, decoded.width, decoded.height);
+    } else if (imageAssetId !== undefined) {
+      if (imageAssetId <= 0) throw new Error('image_asset_id must be a positive number.');
+      image = { kind: 'asset', asset_id: imageAssetId };
+    }
+
+    const maxTriangles = request.max_triangles !== undefined
+      ? this._optionalPositiveInteger(request.max_triangles, 'max_triangles')
+      : undefined;
+    const timeoutMs = request.timeout_ms !== undefined
+      ? this._optionalPositiveInteger(request.timeout_ms, 'timeout_ms')
+      : 120000;
+    if (timeoutMs !== undefined && timeoutMs > 300000) {
+      throw new Error('timeout_ms must be 300000 or less.');
+    }
+    const operationId = request.operation_id;
+    if (operationId !== undefined && !isValidOperationId(operationId)) {
+      throw new Error(`operation_id must contain between 1 and ${MAX_OPERATION_ID_LENGTH} characters.`);
+    }
+    if (request.async !== undefined && typeof request.async !== 'boolean') {
+      throw new Error('async must be a boolean.');
+    }
+
+    const payload: Record<string, unknown> = {
+      prompt,
+      image,
+      schema_groups: schemaGroups,
+      name: typeof request.name === 'string' && request.name !== '' ? request.name : undefined,
+      size: modelSize,
+      max_triangles: maxTriangles,
+      generate_textures: typeof request.generate_textures === 'boolean' ? request.generate_textures : undefined,
+    };
+    if (!schemaGroups) {
+      payload.schema = schema ?? 'Body1';
+    }
+    const submit = request.async === true;
+    if (!referencePng) return this._dispatchGenerateModel(payload, instance_id, timeoutMs, submit, operationId, undefined);
+    const uploadUnavailable = this.referenceUploadUnavailable();
+    if (uploadUnavailable) throw new Error(uploadUnavailable);
+    // Pin the target before preparing anything: a request that cannot reach
+    // an edit Peer must not upload an image first, and the generation must
+    // reach this Studio even if another one connects during the upload. A
+    // retry that names no instance_id returns to its operation's Instance.
+    const pinnedInstanceId = operationId !== undefined ? this.referenceUploads.pinnedInstance(operationId) : undefined;
+    const { targetPeerId, targetInstanceId } = await this._resolveEditTarget(instance_id ?? pinnedInstanceId).catch((error: unknown) => {
+      // A retry that named no instance_id follows its operation; naming another
+      // connected Studio would only collide with that operation's record.
+      if (instance_id === undefined && pinnedInstanceId !== undefined && error instanceof RoutingFailure) {
+        throw new RoutingFailure({
+          ...error.routingError,
+          message: `Operation ${operationId} is tied to Studio instance ${pinnedInstanceId}, which is no longer connected; reconnect that Studio, or start over with a new operation_id.`,
+        });
+      }
+      throw error;
+    });
+    if (submit && !this.bridge.supportsPrimaryFeature('submit')) {
+      throw new RequestFailure(
+        'The primary MCP server cannot start a job that outlives the call; call without async, or restart that server on this version. Nothing was uploaded; queued; not_executed',
+        'primary_unsupported',
+        { requestId: operationId ?? randomUUID(), targetPeerId, stage: 'queued', outcome: 'not_executed', executionOutcome: 'not_executed' },
+      );
+    }
+
+    // Every upload mints a new asset ID, so a retry is identified by the
+    // reference image's content rather than by the dispatched payload.
+    const png = referencePng;
+    const identity = { ...payload, image: { kind: 'png_sha256', sha256: createHash('sha256').update(png).digest('hex') } };
+    const attempt: ReferenceUploadAttempt = {
+      upload: (progress) => this.uploadGenerateModelReferenceImage(png, targetInstanceId, progress),
+      resume: (checkpoint, progress) => this.resumeGenerateModelReferenceImage(checkpoint, targetInstanceId, progress),
+    };
+    if (operationId === undefined && !submit) {
+      // Nothing can retry a call without an operation ID, so nothing is shared.
+      payload.image = { kind: 'asset', asset_id: await attempt.upload(UNTRACKED_UPLOAD) };
+      return this._dispatchGenerateModel(payload, targetInstanceId, timeoutMs, false, undefined, identity);
+    }
+
+    // An async job without a caller ID still needs one before its upload starts.
+    const jobId = operationId ?? randomUUID();
+    const identityKey = createHash('sha256').update(JSON.stringify({ endpoint: '/api/generate-model', identity })).digest('hex');
+    const prepared = this.referenceUploads.lookup(jobId, identityKey, targetPeerId, targetInstanceId);
+    if (operationId !== undefined && !prepared) {
+      // Another server's caller may already have started this operation on
+      // the bridge; rejoin it instead of uploading the image again.
+      const joined = await this.bridge.joinOperation('/api/generate-model', targetPeerId, jobId, identity);
+      if (joined && submit) return this._requestStatusResult(jobId, joined.status);
+      if (joined) return { content: [{ type: 'text', text: JSON.stringify(await joined.response()) }] };
+    }
+    let dispatchPeerId = targetPeerId;
+    const generate = async () => {
+      payload.image = {
+        kind: 'asset',
+        asset_id: await this.referenceUploads.acquire(jobId, identityKey, targetPeerId, targetInstanceId, attempt),
+      };
+      // Dispatch resolves only within the pinned Instance: if it left, this
+      // fails as not admitted and the uploaded image is kept for a retry.
+      return this._dispatchGenerateModel(payload, targetInstanceId, timeoutMs, submit, jobId, identity, (peerId) => {
+        dispatchPeerId = peerId;
+        this.referenceUploads.dispatched(jobId, peerId);
+      });
+    };
+    // Checked again in the same turn that starts the work: a concurrent caller
+    // may have claimed this ID while the bridge was consulted.
+    const current = this.referenceUploads.lookup(jobId, identityKey, targetPeerId, targetInstanceId);
+    const job = generate();
+    this.referenceUploads.attach(jobId, job);
+    job.catch((error: unknown) => {
+      if (generationNotAdmitted(error)) this.referenceUploads.notDispatched(jobId, dispatchPeerId, error);
+    });
+    if (submit && current?.imageAssetId === undefined) {
+      // The job outlives this call from the moment its upload starts. Its
+      // progress and any failure are reported by get_request_status.
+      return this._textResult(this._preparationStatus(jobId, this.referenceUploads.view(jobId)!));
+    }
+    return job;
+  }
+
+  // The edit Peer for instance_id and the Studio Instance it belongs to. A
+  // multi-step operation pins the Instance, so a plugin reload in that Studio
+  // still reaches it, but a different Studio never does.
+  private _resolveEditTarget(instance_id: string | undefined): Promise<{ targetPeerId: string; targetInstanceId: string }> {
+    return this._withSinglePeer('edit', instance_id, undefined, async (targetPeerId, targetInstanceId) => ({ targetPeerId, targetInstanceId }));
+  }
+
+  private async _dispatchGenerateModel(
+    payload: Record<string, unknown>,
+    instance_id: string | undefined,
+    timeoutMs: number | undefined,
+    submit: boolean,
+    operationId: string | undefined,
+    identity: unknown,
+    onDispatch?: (targetPeerId: string) => void,
+  ) {
+    return this._withSinglePeer('edit', instance_id, undefined, async (targetPeerId) => {
+      onDispatch?.(targetPeerId);
+      if (submit) {
+        // The job stays tied to this Peer and outlives the caller; timeout_ms only
+        // bounds how long the bridge holds it open. Observe it with get_request_status.
+        const status = await this.client.submit('/api/generate-model', payload, targetPeerId, timeoutMs, operationId, identity);
+        return this._operationStatusResult(status.requestId, status);
+      }
+      const response = await this._requestPeer('/api/generate-model', payload, targetPeerId, timeoutMs, undefined, operationId, identity);
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    });
+  }
+
+  async previewAsset(
+    assetId: number,
+    includeProperties?: boolean,
+    maxDepth?: number,
+    instance_id?: string,
+    includeAudio = true,
+    maxAudioPreviews = DEFAULT_ASSET_AUDIO_PREVIEWS,
+  ) {
+    if (!assetId) {
+      throw new Error('Asset ID is required for preview_asset');
+    }
+    if (
+      !Number.isSafeInteger(maxAudioPreviews)
+      || maxAudioPreviews < 1
+      || maxAudioPreviews > MAX_ASSET_AUDIO_PREVIEWS
+    ) {
+      throw new Error(
+        `maxAudioPreviews must be an integer between 1 and ${MAX_ASSET_AUDIO_PREVIEWS}.`,
+      );
+    }
+    const response = await this._callSingle('/api/preview-asset', {
+      assetId,
+      includeProperties: includeProperties ?? false,
+      maxDepth: maxDepth ?? DEFAULT_ASSET_PREVIEW_DEPTH,
+    }, undefined, instance_id);
+
+    const responseRecord = asRecord(response);
+    if (!responseRecord) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ assetId, error: 'Studio returned an invalid asset preview response.' }),
+        }],
+      };
+    }
+    const previewError = stringField(responseRecord, 'error');
+    if (previewError) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ assetId, error: previewError }),
+        }],
+      };
+    }
+
+    const soundRows = asRows(responseRecord.sounds);
+    const soundsByAssetId = new Map<number, Record<string, unknown>[]>();
+    for (const sound of soundRows) {
+      const soundAssetId = robloxAssetIdFromContentId(
+        sound.assetId ?? sound.soundId ?? sound.asset,
+      );
+      if (soundAssetId === undefined) continue;
+      const rows = soundsByAssetId.get(soundAssetId) ?? [];
+      rows.push(sound);
+      soundsByAssetId.set(soundAssetId, rows);
+    }
+
+    let directAudioAsset = false;
+    if (includeAudio && soundsByAssetId.size === 0) {
+      try {
+        const details = await this.openCloudClient.getAssetDetails(assetId);
+        const detailsRecord = asRecord(details);
+        const assetRecord = asRecord(detailsRecord?.asset);
+        if (assetRecord?.assetTypeId === 3) {
+          directAudioAsset = true;
+          soundsByAssetId.set(assetId, []);
+        }
+      } catch {
+        // Structural preview remains useful when public metadata is unavailable.
+      }
+    }
+
+    const audioContent: ToolContent[] = [];
+    const audioPreviews: Record<string, unknown>[] = [];
+    let totalBytes = 0;
+    let attempted = 0;
+    for (const [soundAssetId, sources] of soundsByAssetId) {
+      const isDirectAsset = directAudioAsset && soundAssetId === assetId;
+      if (!includeAudio) {
+        continue;
+      }
+      if (attempted >= maxAudioPreviews) {
+        audioPreviews.push({
+          assetId: soundAssetId,
+          status: 'skipped_limit',
+          ...(sources.length > 0 ? { references: sources.length } : {}),
+          ...(isDirectAsset ? { direct: true } : {}),
+        });
+        continue;
+      }
+
+      const remainingBytes = MAX_INLINE_AUDIO_PREVIEW_TOTAL_BYTES - totalBytes;
+      if (remainingBytes <= 0) {
+        audioPreviews.push({
+          assetId: soundAssetId,
+          status: 'skipped_total_size_limit',
+          ...(sources.length > 0 ? { references: sources.length } : {}),
+          ...(isDirectAsset ? { direct: true } : {}),
+        });
+        continue;
+      }
+
+      attempted++;
+      try {
+        const downloaded = await this.openCloudClient.downloadAudioAssetContent(
+          soundAssetId,
+          Math.min(MAX_INLINE_AUDIO_PREVIEW_BYTES, remainingBytes),
+        );
+        totalBytes += downloaded.data.length;
+        audioPreviews.push({
+          assetId: soundAssetId,
+          status: 'included',
+          ...(sources.length > 0 ? { references: sources.length } : {}),
+          ...(isDirectAsset ? { direct: true } : {}),
+          mimeType: downloaded.mimeType,
+          bytes: downloaded.data.length,
+          contentIndex: audioContent.length + 1,
+        });
+        audioContent.push({
+          type: 'audio',
+          data: downloaded.data.toString('base64'),
+          mimeType: downloaded.mimeType,
+        });
+      } catch (error) {
+        audioPreviews.push({
+          assetId: soundAssetId,
+          status: 'unavailable',
+          ...(sources.length > 0 ? { references: sources.length } : {}),
+          ...(isDirectAsset ? { direct: true } : {}),
+          error: errorMessage(error),
+        });
+      }
+    }
+
+    const summary = asRecord(responseRecord.summary);
+    const capabilities = [
+      ['hasAnimations', 'animations'],
+      ['hasSounds', 'sounds'],
+      ['hasParticles', 'particles'],
+      ['hasVfx', 'vfx'],
+      ['hasDecalsOrTextures', 'decalsOrTextures'],
+      ['hasMeshes', 'meshes'],
+      ['hasLights', 'lights'],
+      ['hasAttachments', 'attachments'],
+    ]
+      .filter(([field]) => summary?.[field] === true)
+      .map(([, label]) => label);
+    const classes = asRecord(summary?.classCounts);
+    const compactHierarchy = compactPreviewHierarchy(responseRecord.hierarchy);
+    const compactBody: Record<string, unknown> = {
+      success: true,
+      assetId,
+      totalInstances: numberField(summary, 'totalInstances'),
+      ...(classes && Object.keys(classes).length > 0 ? { classes } : {}),
+      ...(capabilities.length > 0 ? { capabilities } : {}),
+      security: {
+        scanDepth: 'unlimited',
+        scripts: numberField(summary, 'scriptCount'),
+        packageLinks: numberField(summary, 'packageLinkCount'),
+      },
+      ...(compactHierarchy.hierarchy.length > 0
+        ? { hierarchy: compactHierarchy.hierarchy }
+        : {}),
+      ...(compactHierarchy.truncated ? { hierarchyTruncated: true } : {}),
+      ...(soundRows.length > 0
+        ? { sounds: soundRows.map(compactSoundReference) }
+        : {}),
+      ...(directAudioAsset ? { directAudioAsset: true } : {}),
+      ...(includeAudio
+        ? {
+          audio: {
+            returned: audioContent.length,
+            bytes: totalBytes,
+            ...(audioPreviews.length > 0 ? { items: audioPreviews } : {}),
+          },
+        }
+        : {}),
+    };
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(compactBody),
+        },
+        ...audioContent,
+      ],
+    };
+  }
+
+  // Decal asset IDs are the wrapper asset; ImageLabel.Image needs the underlying image
+  // content ID. The only reliable cross-auth way to resolve this is InsertService:LoadAsset
+  // via the connected Studio plugin - the unauthenticated economy endpoint returns 401.
+  private async resolveImageId(decalAssetId: string, instance_id?: string): Promise<string | null> {
+    const code = `
+      local InsertService = game:GetService("InsertService")
+      local ok, result = pcall(function() return InsertService:LoadAsset(${decalAssetId}) end)
+      if not ok then return nil end
+      local decal = result:FindFirstChildWhichIsA("Decal", true)
+      local id = decal and decal.Texture:match("(%d+)") or nil
+      result:Destroy()
+      return id
+    `;
+    try {
+      const response = await this._callSingle('/api/execute-luau', { code }, 'edit', instance_id) as { returnValue?: unknown };
+      const returnValue = response?.returnValue;
+      if (returnValue !== undefined && returnValue !== null && /^\d+$/.test(String(returnValue))) {
+        return String(returnValue);
+      }
+    } catch {
+      // plugin not connected or luau execution failed
+    }
+    return null;
+  }
+
+  private async resolveUploadedReferenceImageId(decalAssetId: string, instance_id?: string): Promise<number> {
+    let lastError = '';
+    for (let attempt = 0; attempt < 10; attempt++) {
+      if (this.openCloudClient.hasApiKey()) {
+        try {
+          const details = await this.openCloudClient.getAssetDetails(Number(decalAssetId));
+          const textureId = details.asset?.textureId;
+          if (typeof textureId === 'number' && Number.isFinite(textureId) && textureId > 0) {
+            return Math.trunc(textureId);
+          }
+        } catch (error) {
+          lastError = errorMessage(error);
+        }
+      }
+
+      const studioImageId = await this.resolveImageId(decalAssetId, instance_id);
+      if (studioImageId !== null) {
+        return Number(studioImageId);
+      }
+
+      if (attempt < 9) {
+        await sleep(1000);
+      }
+    }
+
+    const suffix = lastError ? ` Last resolver error: ${lastError}` : '';
+    throw new Error(`Reference image upload succeeded, but the backing image asset ID could not be resolved for Decal ${decalAssetId}.${suffix}`);
+  }
+
+  // Why a reference image cannot be uploaded from this server, or undefined.
+  // Checked before a generation is routed, so it fails without starting a job.
+  private referenceUploadUnavailable(): string | undefined {
+    if (this.cookieClient.hasCookie()) return undefined;
+    if (!this.openCloudClient.hasApiKey()) {
+      return 'image_path and image_base64 require Roblox asset upload credentials because GenerateModelAsync only accepts rbxassetid:// or rbxasset:// image inputs. Set ROBLOX_OPEN_CLOUD_API_KEY plus ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass image_asset_id.';
+    }
+    if (!resolveUploadCreator()) {
+      return 'Creator identity required for image upload. Set ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass image_asset_id.';
+    }
+    return undefined;
+  }
+
+  private async uploadGenerateModelReferenceImage(
+    imageContent: Buffer,
+    instance_id: string | undefined,
+    progress: ReferenceUploadProgress = UNTRACKED_UPLOAD,
+  ): Promise<number> {
+    if (this.cookieClient.hasCookie()) {
+      const result = await this.cookieClient.uploadImage({
+        fileContent: imageContent,
+        fileName: 'generate-model-reference.png',
+        displayName: STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL,
+        description: STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL,
+        ...resolveUploadCreator(),
+        onSending: () => progress.sending(),
+        onAccepted: (id) => progress.accepted({ provider: 'user_auth', id }),
+      });
+      return result.assetId;
+    }
+
+    const unavailable = this.referenceUploadUnavailable();
+    if (unavailable) throw new Error(unavailable);
+    // referenceUploadUnavailable already rejected a missing creator.
+    const creator = resolveUploadCreator() ?? {};
+
+    const result = await this.openCloudClient.createAsset(
+      {
+        assetType: 'Decal',
+        displayName: STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL,
+        description: STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL,
+        creationContext: { creator },
+      },
+      imageContent,
+      'generate-model-reference.png',
+      {
+        onSending: () => progress.sending(),
+        onAccepted: (id) => progress.accepted({ provider: 'open_cloud', id }),
+      },
+    );
+    return this.resolveCreatedReferenceDecal(result, instance_id, progress);
+  }
+
+  // Continues an upload Roblox already accepted, or resolves the image of a
+  // Decal it already created, without sending the image again.
+  private async resumeGenerateModelReferenceImage(
+    checkpoint: ReferenceUploadCheckpoint,
+    instance_id: string | undefined,
+    progress: ReferenceUploadProgress,
+  ): Promise<number> {
+    if (checkpoint.createdAssetId !== undefined) {
+      return this.resolveUploadedReferenceImageId(checkpoint.createdAssetId, instance_id);
+    }
+    const operation = checkpoint.remoteOperation;
+    if (!operation) throw new Error('A reference image upload can only be resumed from a remote operation.');
+    if (operation.provider === 'user_auth') {
+      return (await this.cookieClient.resumeImageUpload(operation.id)).assetId;
+    }
+    return this.resolveCreatedReferenceDecal(await this.openCloudClient.resumeAssetOperation(operation.id), instance_id, progress);
+  }
+
+  private async resolveCreatedReferenceDecal(
+    result: AssetOperationResponse,
+    instance_id: string | undefined,
+    progress: ReferenceUploadProgress,
+  ): Promise<number> {
+    const decalId = result.response?.assetId;
+    if (!decalId || !/^\d+$/.test(decalId)) {
+      throw new Error('Reference image upload did not return an asset ID.');
+    }
+    progress.created(decalId);
+    return this.resolveUploadedReferenceImageId(decalId, instance_id);
+  }
+
+  async uploadAsset(
+    filePath: string,
+    assetType: string,
+    displayName: string,
+    description?: string,
+    userId?: string,
+    groupId?: string
+  ) {
+    // Non-blocking and bounded: a FIFO cannot stall the server and an
+    // oversized file is rejected before it is read or uploaded.
+    const limitBytes = openCloudAssetUploadLimitBytes(assetType);
+    const fileContent = await readRegularFileWithinLimitAsync(filePath, 'File', (size) => {
+      if (size > limitBytes) {
+        const limit = assetType === 'Video' ? '3.75 GB' : '20 MB';
+        throw new Error(`File exceeds Roblox's ${limitBytes}-byte (${limit}) ${assetType} upload limit: ${filePath}`);
+      }
+    });
+    const fileName = path.basename(filePath);
+    const resolvedCreator = resolveUploadCreator(userId, groupId);
+
+    if (assetType === 'Decal' && this.cookieClient.hasCookie()) {
+      const result = await this.cookieClient.uploadImage({
+        fileContent,
+        fileName,
+        displayName,
+        description: description || '',
+        ...resolvedCreator,
+      });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            done: true,
+            response: {
+              assetId: String(result.assetId),
+              displayName,
+              assetType: 'Image',
+              decalId: null,
+              imageId: String(result.assetId),
+            },
+          })
+        }]
+      };
+    }
+
+    if (!this.openCloudClient.hasApiKey()) {
+      const cookieHint = assetType === 'Decal'
+        ? ' Alternatively, set ROBLOSECURITY to use cookie auth.'
+        : '';
+      throw new Error(
+        `No auth configured for ${assetType} upload. Set ROBLOX_OPEN_CLOUD_API_KEY (needs asset:write scope).${cookieHint}`
+      );
+    }
+
+    if (!resolvedCreator) {
+      throw new Error(
+        'Creator identity required for Open Cloud upload. Set ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass userId/groupId as parameters.'
+      );
+    }
+    const creator = resolvedCreator;
+
+    const result = await this.openCloudClient.createAsset(
+      {
+        assetType: assetType as 'Audio' | 'Decal' | 'Model' | 'Animation' | 'Video',
+        displayName,
+        description: description || '',
+        creationContext: { creator },
+      },
+      fileContent,
+      fileName
+    );
+
+    // Decals: also resolve the underlying image content ID for ImageLabel.Image usage.
+    if (assetType === 'Decal') {
+      const decalId = result.response?.assetId;
+      const imageId = decalId ? await this.resolveImageId(decalId) : null;
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...result,
+            decalId: decalId ?? null,
+            imageId,
+          })
+        }]
+      };
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result)
+      }]
+    };
+  }
+
+  async simulateMouseInput(action: string, x: number, y: number, button?: string, wheel?: number, target?: string, instance_id?: string) {
+    if (!action) {
+      throw new Error('action is required for simulate_mouse_input');
+    }
+    if (action === 'scroll' && (typeof wheel !== 'number' || !Number.isFinite(wheel) || wheel === 0)) {
+      throw new Error('wheel must be a non-zero number when action is scroll');
+    }
+    // Default to the running playtest client (where the input pipeline lives)
+    // when the caller didn't pick a target; fall back to edit otherwise.
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const { instanceId, clientRole } = this._resolveRuntime(instance_id);
+    const role = this._targetForInstanceId(instance_id, { requested: target, fallback: clientRole ?? 'edit', accepts: isClientRole });
+    const response = await this._callSingle('/api/simulate-mouse-input', {
+      action, x, y, button, wheel
+    }, role, instanceId);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(response)
+      }]
+    };
+  }
+
+  async simulateKeyboardInput(keyCode?: string, action?: string, duration?: number, text?: string, target?: string, instance_id?: string) {
+    if (!keyCode && text === undefined) {
+      throw new Error('keyCode or text is required for simulate_keyboard_input');
+    }
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const { instanceId, clientRole } = this._resolveRuntime(instance_id);
+    const role = this._targetForInstanceId(instance_id, { requested: target, fallback: clientRole ?? 'edit', accepts: isClientRole });
+    const response = await this._callSingle('/api/simulate-keyboard-input', {
+      keyCode, action, duration, text
+    }, role, instanceId);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(response)
+      }]
+    };
+  }
+
+  async findAndReplaceInScripts(
+    pattern: string,
+    replacement: string,
+    options?: {
+      caseSensitive?: boolean;
+      usePattern?: boolean;
+      path?: string;
+      classFilter?: string;
+      dryRun?: boolean;
+      maxReplacements?: number;
+      expectedRevisions?: unknown;
+    },
+    instance_id?: string,
+    operation_id?: string,
+  ) {
+    if (!pattern) {
+      throw new Error('pattern is required for find_and_replace_in_scripts');
+    }
+    if (replacement === undefined || replacement === null) {
+      throw new Error('replacement is required for find_and_replace_in_scripts');
+    }
+    const { expectedRevisions: requestedRevisions, ...searchOptions } = options ?? {};
+    assertScriptClassFilter('find_and_replace_in_scripts', searchOptions.classFilter);
+    const { maxReplacements } = searchOptions;
+    if (maxReplacements !== undefined && (!Number.isInteger(maxReplacements) || maxReplacements < 1)) {
+      throw new Error('find_and_replace_in_scripts maxReplacements must be a positive integer');
+    }
+    const expectedRevisions = optionalRevisionMap('find_and_replace_in_scripts', requestedRevisions);
+    const response = await this._callSingle('/api/find-and-replace-in-scripts', {
+      pattern,
+      replacement,
+      ...searchOptions,
+      ...(expectedRevisions === undefined ? {} : { expectedRevisions }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
+  }
+
+  async getMemoryBreakdown(target?: string, tags?: string[], instance_id?: string) {
+    const data: Record<string, unknown> = {};
+    if (tags !== undefined) data.tags = tags;
+    return this._readPeerOrFanOut('/api/get-memory-breakdown', data, target, instance_id);
+  }
+
+  async getSceneAnalysis(mode?: string, target?: string, topN?: number, raw?: boolean, instance_id?: string) {
+    const data: Record<string, unknown> = {};
+    if (mode !== undefined) data.mode = mode;
+    if (topN !== undefined) data.topN = topN;
+    if (raw !== undefined) data.raw = raw;
+    return this._readPeerOrFanOut('/api/get-scene-analysis', data, target, instance_id);
+  }
+
+  // One Peer returns its response as is. A fanout keys each Peer's response by
+  // role and classifies it here, from the request outcome and the response
+  // envelope only: data nested inside a successful response is never inspected.
+  private async _readPeerOrFanOut(endpoint: string, data: Record<string, unknown>, target: string | undefined, instance_id: string | undefined) {
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const tgt = this._targetForInstanceId(instance_id, { requested: target, fallback: 'all', accepts: anyRole });
+    const resolved = this.bridge.resolveTarget({ instance_id, target: tgt });
+    if (!resolved.ok) throw new RoutingFailure(resolved.error);
+
+    if (resolved.mode === 'single') {
+      return this._textResult(await this._requestPeer(endpoint, data, resolved.targetPeerId));
+    }
+
+    const { targets } = resolved;
+    const responses = await Promise.allSettled(
+      targets.map((peer) => this._requestPeer(endpoint, data, peer.targetPeerId)),
+    );
+    const peers: Record<string, unknown> = {};
+    const failures: string[] = [];
+    responses.forEach((response, index) => {
+      const role = targets[index].targetRole;
+      if (response.status === 'rejected') {
+        const failure = peerRequestFailure(response.reason);
+        peers[role] = failure;
+        failures.push(`${role}: ${failure.error}`);
+      } else {
+        peers[role] = response.value;
+        const handlerError = asRecord(response.value)?.error;
+        if (typeof handlerError === 'string') failures.push(`${role}: ${boundedMessage(handlerError)}`);
+      }
+    });
+    const summary = { requested: targets.length, succeeded: targets.length - failures.length, failed: failures.length };
+    if (summary.succeeded === 0) {
+      return this._textResult({
+        error: 'all_peers_failed',
+        message: boundedMessage(`Every Peer failed: ${failures.join('; ')}`),
+        summary,
+        ...peers,
+      });
+    }
+    return this._textResult({ ...(summary.failed > 0 ? { partial: true } : {}), summary, ...peers });
+  }
+
+  async exportRbxm(instancePaths: string[], outputPath: string, target?: string, instance_id?: string) {
+    if (!Array.isArray(instancePaths) || instancePaths.length === 0) {
+      throw new Error('instance_paths must be a non-empty array for export_rbxm');
+    }
+    if (!outputPath || typeof outputPath !== 'string') {
+      throw new Error('output_path is required for export_rbxm');
+    }
+    if (target && target !== 'edit' && target !== 'server') {
+      throw new Error(`export_rbxm target must be "edit" or "server" (got: ${target})`);
+    }
+
+    const response = await this._callSingle(
+      '/api/export-rbxm',
+      { instance_paths: instancePaths },
+      { requested: target, fallback: 'edit', accepts: (role) => role === 'server' },
+      instance_id,
+    ) as { error?: string; base64?: string; instance_count?: number };
+
+    const notice = pathNotice(response);
+    if (response.error) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: response.error, ...notice }) }] };
+    }
+    if (!response.base64) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'plugin returned no base64 payload', ...notice }) }] };
+    }
+
+    const bytes = Buffer.from(response.base64, 'base64');
+    const resolved = path.resolve(outputPath);
+    try {
+      fs.mkdirSync(path.dirname(resolved), { recursive: true });
+      fs.writeFileSync(resolved, bytes);
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `failed to write ${resolved}: ${(err as Error).message}`, ...notice }) }] };
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          bytes_written: bytes.length,
+          instance_count: response.instance_count ?? instancePaths.length,
+          output_path: resolved,
+          ...notice,
+        }),
+      }],
+    };
+  }
+
+  async importRbxm(
+    source: { path?: string; url?: string; base64?: string } | undefined,
+    parentPath: string,
+    target?: string,
+    instance_id?: string,
+    signal?: AbortSignal,
+    operation_id?: string,
+  ) {
+    if (!source || typeof source !== 'object') {
+      throw new Error('source is required for import_rbxm');
+    }
+    if (!parentPath || typeof parentPath !== 'string') {
+      throw new Error('parent_path is required for import_rbxm');
+    }
+    if (target && target !== 'edit' && target !== 'server') {
+      throw new Error(`import_rbxm target must be "edit" or "server" (got: ${target})`);
+    }
+
+    const modes = ['path', 'url', 'base64'].filter((k) => (source as Record<string, unknown>)[k] !== undefined);
+    if (modes.length !== 1) {
+      throw new Error(`source must contain exactly one of { path, url, base64 } (got: ${modes.join(', ') || 'none'})`);
+    }
+    // Checked before the input is read; the bridge would reject it only after.
+    if (operation_id !== undefined && !isValidOperationId(operation_id)) {
+      throw new Error(`operation_id must be a nonblank string of at most ${MAX_OPERATION_ID_LENGTH} characters.`);
+    }
+
+    let input: Awaited<ReturnType<typeof readRbxmInput>>;
+    try {
+      input = await readRbxmInput(source, parentPath, signal);
+    } catch (error) {
+      return this._textResult({ error: error instanceof Error ? error.message : String(error) });
+    }
+    const { bytes, sourceLabel } = input;
+    // The payload carries the bytes read, so a retry under the same operation_id
+    // recovers the first result only when the file or URL still holds them.
+    const response = await this._callSingle(
+      '/api/import-rbxm',
+      {
+        base64: bytes.toString('base64'),
+        parent_path: parentPath,
+        source_label: sourceLabel,
+      },
+      { requested: target, fallback: 'edit', accepts: (role) => role === 'server' },
+      instance_id,
+      undefined,
+      signal,
+      operation_id,
+    );
+
+    return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+  }
+
+  // Even native capture must wait while another call has fitted the simulator
+  // or drawn markers. Otherwise it could observe temporary UI or dimensions.
+  private async _captureViewportImage(
+    instanceId: string,
+    targetRole: string,
+    format?: string,
+    quality?: number,
+    maxBytes: number = MAX_INLINE_IMAGE_BYTES,
+  ): Promise<EncodedViewportCapture> {
+    const fmt: 'jpeg' | 'png' = format === 'png' ? 'png' : 'jpeg';
+    return await this._withViewportQueue(instanceId, async () => {
+      const raw = await this._captureViewportRawNow(instanceId, targetRole, fmt === 'png' ? 'png' : 'rgba8');
+      return raw.success ? this._encodeViewportCapture(raw, fmt, quality, maxBytes) : raw;
+    });
+  }
+
+  // Captures `count` frames `intervalMs` apart. The caller holds the viewport
+  // queue, so no other capture or marker transaction runs in between.
+  private async _captureViewportFramesNow(
+    instanceId: string,
+    targetRole: string,
+    encoding: 'png' | 'rgba8',
+    count: number,
+    intervalMs: number,
+  ): Promise<ViewportFramesCapture> {
+    const startedAt = Date.now();
+    const frames: Array<{ capture: RawViewportCaptureOk; atMs: number }> = [];
+    for (let index = 0; index < count; index++) {
+      const wait = startedAt + index * intervalMs - Date.now();
+      if (wait > 0) await sleep(wait);
+      const atMs = Date.now() - startedAt;
+      const capture = await this._captureViewportRawNow(instanceId, targetRole, encoding);
+      if (!capture.success) return { ...capture, error: `frame ${index + 1} of ${count}: ${capture.error}` };
+      frames.push({ capture, atMs });
+    }
+    return { success: true, frames };
+  }
+
+  // Serializes viewport readers and marker transactions per Studio process.
+  private async _withViewportQueue<T>(instanceId: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.viewportCaptureQueues.get(instanceId) ?? Promise.resolve();
+    const capture = previous.then(run);
+    const settled = capture.then(() => undefined, () => undefined);
+    this.viewportCaptureQueues.set(instanceId, settled);
+    try {
+      return await capture;
+    } finally {
+      if (this.viewportCaptureQueues.get(instanceId) === settled) this.viewportCaptureQueues.delete(instanceId);
+    }
+  }
+
+  // One unencoded viewport frame, from Studio or from the host window.
+  // `encoding` only picks what Studio's fast path returns; the host window and
+  // the CaptureService fallbacks always answer with raw RGBA.
+  private async _captureViewportRawNow(
+    instanceId: string,
+    targetRole: string,
+    encoding: 'png' | 'rgba8',
+  ): Promise<RawViewportCapture> {
+    // Native Linux runs Studio under Wine, where Studio's own capture of the
+    // play viewport fails or comes back black. When the Studio process is
+    // known, grab its X11 window first and use Studio's capture as the fallback.
+    let hostFirstError: string | undefined;
+    if (isHostCapturePreferred() && await this._hostCaptureProcessId(instanceId) !== undefined) {
+      const host = await this._captureViewportFromHostWindow(instanceId, targetRole);
+      if (host.success) return { success: true, response: host.response, hostNote: '' };
+      hostFirstError = host.error;
+    }
+
+    // Fast path: StudioCaptureService (Studio-only, FFlag-gated) reads the
+    // framebuffer directly — no CaptureService callback, no EditableImage
+    // promotion, no client-to-edit temp-texture handoff — and it captures what
+    // Studio renders, SurfaceGui.AlwaysOnTop included (the legacy path misses
+    // that layer).
+    //
+    // It MUST run in the DataModel that is being rendered. Verified live: with
+    // a playtest active the edit peer still reports CanCaptureScreenshot()
+    // true, yet the capture never leaves BufferStatus.Pending (no errors, even
+    // after the playtest stops), while the same call in the play client peer
+    // completes. So the request follows targetRole, which is already the
+    // rendering peer: 'edit' when idle, 'client-N' during a playtest.
+    let response = await this._callSingle(
+      '/api/capture-studio',
+      { encoding },
+      targetRole,
+      instanceId,
+    ) as RawImageCaptureResponse;
+
+    // A plugin older than this server rejects the endpoint outright — from the
+    // edit peer as "Unknown endpoint", from the play client as "Unsupported
+    // client broker endpoint". Both mean the fast path is absent, same as
+    // `unavailable`.
+    const studioFastPathMissing =
+      response.unavailable !== undefined ||
+      (response.error?.includes('/api/capture-studio') ?? false);
+    const studioFastPathUnavailable = studioFastPathMissing ? response.unavailable ?? response.error : undefined;
+
+    if (studioFastPathMissing && hostFirstError === undefined && isHostCapturePreferred()) {
+      // A Studio this server did not launch has no known process, so it skips
+      // the host-first grab above. Grab its window before falling back to
+      // CaptureService, which hands Wine play clients black frames; every
+      // Studio display is searched and the viewport markers pick the window.
+      const host = await this._captureViewportFromHostWindow(instanceId, targetRole);
+      if (host.success) return { success: true, response: host.response, hostNote: '', studioFastPathUnavailable };
+      hostFirstError = host.error;
+    }
+    if (studioFastPathMissing) {
+      if (targetRole.startsWith('client-')) {
+        // Play mode. The running game VM can trigger CaptureScreenshot but can't
+        // read the resulting temp texture back (privilege gate). So capture on
+        // the client to get the rbxtemp:// id, then read it back in the edit DM —
+        // the rbxtemp handle is process-scoped and the edit/plugin identity is
+        // allowed to promote it into a readable EditableImage.
+        const begin = await this._callSingle('/api/capture-begin', {}, targetRole, instanceId) as {
+          contentId?: string;
+          error?: string;
+          screenWidth?: number;
+          screenHeight?: number;
+        };
+        if (begin.error) {
+          response = { error: begin.error };
+        } else if (!begin.contentId) {
+          response = { error: 'Screenshot capture failed: no content id returned from client.' };
+        } else {
+          response = await this._callSingle('/api/capture-read', { contentId: begin.contentId }, 'edit', instanceId) as RawImageCaptureResponse;
+          // Only the client DM can measure its simulated screen; the edit DM reads pixels.
+          if (!response.error && begin.screenWidth && begin.screenHeight) {
+            response = { ...response, screenWidth: begin.screenWidth, screenHeight: begin.screenHeight };
+          }
+        }
+      } else {
+        // Edit mode: capture and read back in the same (edit) context.
+        response = await this._callSingle('/api/capture-screenshot', {}, 'edit', instanceId) as RawImageCaptureResponse;
+      }
+      response.source ??= 'CaptureService';
+    }
+
+    // Studio-side capture can come back unusable for the play viewport even
+    // though nothing errored: CaptureService hands the play client a fully
+    // black frame on some Studio builds. When the frame is flat (or Studio
+    // failed outright), grab the Studio window through the host OS instead and
+    // crop it to the viewport. That path reads the composited window, so it
+    // also works while Studio sits behind other windows.
+    let hostNote = '';
+    let hostReason: string | undefined;
+    try {
+      hostReason = response.error
+        ? `Studio's capture failed (${response.error})`
+        : this._isUniformCaptureResponse(response)
+          ? `Studio's ${response.source ?? 'capture'} returned a blank (single-colour) frame`
+          : undefined;
+    } catch (error) {
+      response = { ...response, error: `Could not decode Studio's screenshot: ${error instanceof Error ? error.message : String(error)}` };
+      hostReason = `Studio's capture failed (${response.error})`;
+    }
+    if (hostFirstError !== undefined) {
+      if (response.error) {
+        response = { ...response, error: `${response.error} Host window capture failed first: ${hostFirstError}.` };
+      } else {
+        hostNote = hostReason === undefined
+          ? ` Host window capture failed (${hostFirstError}), so this came from Studio's ${response.source ?? 'capture'}.`
+          : ` Warning: host window capture failed (${hostFirstError}) and ${hostReason}, so this image may be blank.`;
+      }
+    } else if (hostReason !== undefined) {
+      const host = await this._captureViewportFromHostWindow(instanceId, targetRole);
+      if (host.success) {
+        response = host.response;
+        hostNote = ` Captured from the Studio window through the host OS because ${hostReason}.`;
+      } else if (response.error) {
+        response = { ...response, error: `${response.error} Host window capture also failed: ${host.error}.` };
+      } else {
+        hostNote = ` Warning: ${hostReason} and host window capture also failed (${host.error}), so this image may be blank.`;
+      }
+    }
+
+    if (response.error) {
+      let text = response.error;
+      if (
+        targetRole.startsWith('client-') &&
+        response.error.includes('Failed to load texture, unexpected format') &&
+        await this._isMultiplayerTestRunning(instanceId)
+      ) {
+        text =
+          'Screenshot capture reached the multiplayer client, but Roblox returned a temporary screenshot texture ' +
+          'that the edit peer cannot read in StudioTestService multiplayer sessions. Regular solo_playtest capture ' +
+          'works because the temporary rbxtemp:// handle is readable from the edit process; multiplayer client handles ' +
+          `appear to be scoped to the client process. Raw error: ${response.error}`;
+      }
+      return { success: false, error: text, studioFastPathUnavailable };
+    }
+    let deviceScreen: { width: number; height: number } | undefined;
+    try {
+      const resampled = resampleCaptureToDeviceScreen(response);
+      if (resampled) {
+        deviceScreen = { width: resampled.nativeWidth ?? 0, height: resampled.nativeHeight ?? 0 };
+        response = resampled;
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: `Could not resample the screenshot to the simulated device screen: ${error instanceof Error ? error.message : String(error)}`,
+        studioFastPathUnavailable,
+      };
+    }
+    if (response.width === undefined || response.height === undefined) {
+      return { success: false, error: 'Screenshot response missing dimensions.', studioFastPathUnavailable };
+    }
+    return { success: true, response, hostNote, studioFastPathUnavailable, ...(deviceScreen ? { deviceScreen } : {}) };
+  }
+
+  private _encodeViewportCapture(
+    raw: RawViewportCaptureOk,
+    fmt: 'jpeg' | 'png',
+    quality: number | undefined,
+    maxBytes: number,
+  ): EncodedViewportCapture {
+    const { response, hostNote, studioFastPathUnavailable, deviceScreen } = raw;
+    const q = quality === undefined ? 92 : Math.max(1, Math.min(100, Math.floor(quality)));
+    const w = response.width;
+    const h = response.height;
+    if (w === undefined || h === undefined) {
+      return { success: false, error: 'Screenshot response missing dimensions.' };
+    }
+
+    // Cap the inline image size. Measured empirically: an ~8MB image (11MB
+    // base64) returns fine, but ~16MB (22MB base64) CLOSES the MCP connection
+    // and drops every Studio registration — a catastrophic failure, not a
+    // graceful error. 6MB is in the proven-safe range with comfortable margin.
+    // For PNG we refuse (rather than silently dropping the lossless guarantee
+    // the caller asked for); for JPEG we step quality down so the call still
+    // succeeds.
+    let buffer: Buffer;
+    let mimeType: string;
+    if (response.encoding === 'png') {
+      // StudioCaptureService already encoded the PNG in Studio.
+      if (!response.data) {
+        return { success: false, error: 'Screenshot response missing PNG data.' };
+      }
+      buffer = Buffer.from(response.data, 'base64');
+      mimeType = 'image/png';
+    } else {
+      const encoded = encodeImageFromRgbaResponse(response, fmt, q);
+      buffer = encoded.buffer;
+      mimeType = encoded.mimeType;
+    }
+    let usedQ = q;
+    let note = '';
+
+    if (buffer.length > maxBytes) {
+      if (fmt === 'png') {
+        const mb = (buffer.length / 1048576).toFixed(1);
+        return {
+          success: false,
+          error:
+            `PNG screenshot is ${mb}MB, over the ~${(maxBytes / 1048576).toFixed(1)}MB inline image limit. ` +
+            `Use the default jpeg format (optionally with a "quality" value) or make the Studio window smaller for a lossless capture.`,
+        };
+      }
+      while (buffer.length > maxBytes && usedQ > 25) {
+        usedQ = Math.max(25, usedQ - 20);
+        buffer = encodeImageFromRgbaResponse(response, 'jpeg', usedQ).buffer;
+      }
+      if (buffer.length > maxBytes) {
+        return {
+          success: false,
+          error:
+            `JPEG screenshot is still ${(buffer.length / 1048576).toFixed(1)}MB at q${usedQ}, over the ` +
+            `${(maxBytes / 1048576).toFixed(1)}MB inline budget. Make the Studio window smaller or capture fewer images per call.`,
+        };
+      }
+      note = ` — auto-reduced to q${usedQ} to fit the inline size limit; enlarge the Studio window or capture a smaller region for finer detail`;
+    }
+
+    // Explicit coordinate contract: the image is returned at native viewport
+    // resolution whenever it fits the transport cap, so its pixel grid IS the
+    // coordinate space simulate_mouse_input expects. Oversized captures are
+    // downscaled in Studio before transfer; the message then tells the caller
+    // how to map image coordinates back to viewport coordinates.
+    const nativeW = response.nativeWidth ?? w;
+    const nativeH = response.nativeHeight ?? h;
+    const message =
+      (nativeW !== w || nativeH !== h
+        ? `Screenshot ${w}x${h}px (${fmt}${fmt === 'jpeg' ? ` q${usedQ}` : ''})${note}, downscaled from the ` +
+          `${nativeW}x${nativeH} viewport to fit transport limits. For simulate_mouse_input, multiply x read off ` +
+          `this image by ${(nativeW / w).toFixed(4)} and y by ${(nativeH / h).toFixed(4)} to get viewport pixel ` +
+          `coordinates ((0,0) at the top-left).`
+        : `Screenshot ${w}x${h}px (${fmt}${fmt === 'jpeg' ? ` q${usedQ}` : ''})${note}. ` +
+          `For simulate_mouse_input, x/y are pixel coordinates in this exact image with (0,0) at the ` +
+          `top-left; it is not downscaled, so use coordinates as you read them off the image.`) +
+      deviceScreenNote(deviceScreen) + hostNote;
+
+    return {
+      success: true,
+      width: w,
+      height: h,
+      format: fmt,
+      quality: fmt === 'jpeg' ? usedQ : undefined,
+      note,
+      data: buffer.toString('base64'),
+      mimeType,
+      message,
+      source: response.source,
+      studioFastPathUnavailable,
+    };
+  }
+
+  private _isUniformCaptureResponse(response: RawImageCaptureResponse): boolean {
+    if (!response.data || !response.width || !response.height) return false;
+    const data = Buffer.from(response.data, 'base64');
+    if (response.encoding === 'png') return isUniformPng(data);
+    return isUniformFrame(data, response.width, response.height);
+  }
+
+  private _hostCaptureTitleHint(instanceId: string): string | undefined {
+    const peers = this.bridge.getPeers().filter((peer) => peer.instanceId === instanceId);
+    const edit = peers.find((peer) => peer.role === 'edit') ?? peers[0];
+    const name = edit?.dataModelName || edit?.placeName;
+    return name ? name : undefined;
+  }
+
+  private async _callViewportMarkers(
+    action: 'prepare' | 'show' | 'hide' | 'query' | 'finish',
+    targetRole: string,
+    instanceId: string,
+    captureId?: string,
+  ): Promise<ViewportMarkerResponse> {
+    return await this._callSingle('/api/capture-markers', { action, ...(captureId ? { captureId } : {}) }, targetRole, instanceId) as ViewportMarkerResponse;
+  }
+
+  // Linux only: the managed Studio process that owns the viewport, so the X11
+  // grab searches its display first. Multiplayer client instances are not
+  // managed; their group's controller runs on the same display. Cached as long
+  // as a located viewport, because the lookup snapshots processes.
+  private async _hostCaptureProcessId(instanceId: string): Promise<number | undefined> {
+    // WSL grabs through the Windows helper, which takes no process hint.
+    if (!isNativeLinuxHost()) return undefined;
+    const cached = this.hostCaptureProcessIds.get(instanceId);
+    if (cached && (cached.discovered || Date.now() - cached.cachedAt < HOST_VIEWPORT_RECT_TTL_MS)) return cached.processId;
+    const controller = this.bridge.getMultiplayerGroups()
+      .find((group) => group.instanceIds.includes(instanceId))?.controllerInstanceId;
+    let processId: number | undefined;
+    for (const candidate of [instanceId, controller]) {
+      if (candidate === undefined || processId !== undefined) continue;
+      try {
+        const record = await this.instanceManager.get(candidate);
+        if (record && record.closedAt === undefined) processId = record.nativeProcessId;
+      } catch {
+        // Without a hint every Studio display is searched; capture still works.
+      }
+    }
+    this.hostCaptureProcessIds.set(instanceId, { processId, cachedAt: Date.now() });
+    return processId;
+  }
+
+  // Always restore the simulator, including failures and cached window grabs.
+  private async _captureViewportFromHostWindow(
+    instanceId: string,
+    targetRole: string,
+  ): Promise<HostViewportCaptureResult> {
+    // Avoid changing simulator scaling or drawing markers when no host capture
+    // can run. The OS helper's own guard is otherwise reached only after show.
+    if (isHostCaptureDisabled()) {
+      return { success: false, error: 'host window capture is disabled by ROBLOX_STUDIO_HOST_CAPTURE' };
+    }
+    if (!isHostCaptureSupported()) {
+      return { success: false, error: hostCaptureUnsupportedReason() };
+    }
+    const linuxUnavailable = linuxHostCaptureUnavailableReason();
+    if (linuxUnavailable !== undefined) return { success: false, error: linuxUnavailable };
+    // Cold Swift compilation must finish before the plugin starts its bounded
+    // marker transaction. Injected backends need no host helper preparation.
+    if (this.hostWindowCapture === captureStudioWindow) {
+      try {
+        await prepareHostWindowCapture();
+      } catch (error) {
+        return { success: false, error: `could not prepare host capture: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    // The registry lookup (a process snapshot) overlaps the plugin round trip.
+    const processIdLookup = this._hostCaptureProcessId(instanceId);
+    let prepared: ViewportMarkerResponse | undefined;
+    let result: HostViewportCaptureResult;
+    try {
+      prepared = await this._callViewportMarkers('prepare', targetRole, instanceId);
+      if (prepared.error || !prepared.captureId || !prepared.viewportWidth || !prepared.viewportHeight) {
+        result = { success: false, error: prepared.error ?? 'the Studio plugin could not prepare host capture (update the plugin)' };
+      } else {
+        if (prepared.viewportChanged) this.hostViewportRects.delete(`${instanceId}|${targetRole}`);
+        result = await this._capturePreparedViewportFromHostWindow(instanceId, targetRole, prepared, await processIdLookup);
+      }
+    } catch (error) {
+      result = { success: false, error: `host capture failed: ${error instanceof Error ? error.message : String(error)}` };
+    } finally {
+      if (prepared?.captureId) {
+        try {
+          const restored = await this._callViewportMarkers('finish', targetRole, instanceId, prepared.captureId);
+          if (restored.error) result = { success: false, error: `could not restore the Studio viewport: ${restored.error}` };
+          else if (restored.stale || !restored.success) result = { success: false, error: 'the host capture transaction expired or lost ownership; retry the capture' };
+        } catch (error) {
+          result = { success: false, error: `could not restore the Studio viewport: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+    }
+    if (!result.success) this.hostViewportRects.delete(`${instanceId}|${targetRole}`);
+    return result;
+  }
+
+  // Grabs the Studio window through the host OS and crops it to the viewport
+  // of `targetRole`. The plugin pins magenta markers to the viewport corners
+  // so the crop is exact regardless of Studio's dock layout or DPI scale; the
+  // located rect is cached briefly so repeated captures cost one window grab.
+  // On Linux the markers also pick the right window when several Studio
+  // windows share a display (multiplayer server and clients).
+  private async _capturePreparedViewportFromHostWindow(
+    instanceId: string,
+    targetRole: string,
+    prepared: ViewportMarkerResponse,
+    processId?: number,
+  ): Promise<HostViewportCaptureResult> {
+    const titleHint = this._hostCaptureTitleHint(instanceId);
+    const cacheKey = `${instanceId}|${targetRole}`;
+    const cached = this.hostViewportRects.get(cacheKey);
+
+    let sizeInfo: ViewportMarkerResponse;
+    try {
+      sizeInfo = await this._callViewportMarkers('query', targetRole, instanceId, prepared.captureId);
+    } catch (error) {
+      return { success: false, error: `viewport markers unavailable: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (sizeInfo.error || !sizeInfo.viewportWidth || !sizeInfo.viewportHeight) {
+      return {
+        success: false,
+        error: sizeInfo.error ?? 'the Studio plugin did not report a viewport size (update the plugin to a build with /api/capture-markers)',
+      };
+    }
+    // Fitting the physical presentation can round the camera size by a pixel.
+    // Return the original logical size, which is restored before input resumes.
+    const viewportWidth = prepared.viewportWidth ?? sizeInfo.viewportWidth;
+    const viewportHeight = prepared.viewportHeight ?? sizeInfo.viewportHeight;
+
+    // Fast path: the viewport was located recently and neither the window nor
+    // the viewport changed size, so one grab is enough.
+    if (
+      cached &&
+      Date.now() - cached.cachedAt < HOST_VIEWPORT_RECT_TTL_MS &&
+      cached.viewportWidth === viewportWidth &&
+      cached.viewportHeight === viewportHeight
+    ) {
+      const grab = await this.hostWindowCapture(titleHint, cached.identity, { processId });
+      if (!grab.ok) return { success: false, error: grab.error };
+      if (cached.identity !== undefined && !sameHostWindowIdentity(grab.capture.identity, cached.identity)) {
+        return { success: false, error: 'the Studio window identity changed since locating the viewport; retry the capture' };
+      }
+      if (grab.capture.width === cached.windowWidth && grab.capture.height === cached.windowHeight) {
+        return {
+          success: true,
+          response: this._hostResponseFromCrop(grab.capture.rgba, grab.capture.width, grab.capture.height, cached.rect, viewportWidth, viewportHeight),
+        };
+      }
+      this.hostViewportRects.delete(cacheKey);
+    }
+
+    // Locate the viewport: markers on, grab, markers off, grab again clean.
+    let shown: ViewportMarkerResponse;
+    try {
+      shown = await this._callViewportMarkers('show', targetRole, instanceId, prepared.captureId);
+    } catch (error) {
+      return { success: false, error: `could not draw viewport markers: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (shown.error) return { success: false, error: `could not draw viewport markers: ${shown.error}` };
+    const markerSize = shown.markerSize ?? 12;
+    const markerHint: ViewportMarkerHint = {
+      viewportWidth: shown.viewportWidth ?? viewportWidth,
+      viewportHeight: shown.viewportHeight ?? viewportHeight,
+      markerSize,
+      markerLayout: shown.markerLayout === 'edges' ? 'edges' : 'corners',
+    };
+
+    let markerGrab: HostCaptureResult;
+    let hidden: ViewportMarkerResponse;
+    try {
+      markerGrab = await this.hostWindowCapture(titleHint, undefined, {
+        processId,
+        accept: (capture) => !('error' in findViewportRect(capture.rgba, capture.width, capture.height, markerHint)),
+      });
+    } finally {
+      hidden = await this._callViewportMarkers('hide', targetRole, instanceId, prepared.captureId);
+    }
+    if (hidden.error) return { success: false, error: `could not hide viewport markers: ${hidden.error}` };
+    if (!markerGrab.ok) return { success: false, error: markerGrab.error };
+
+    const located = locateViewportInFrame(markerGrab.capture.rgba, markerGrab.capture.width, markerGrab.capture.height, markerHint, 'window');
+    if ('error' in located) return { success: false, error: located.error };
+
+    const cleanGrab = await this.hostWindowCapture(titleHint, markerGrab.capture.identity, { processId });
+    if (!cleanGrab.ok) return { success: false, error: cleanGrab.error };
+    if (markerGrab.capture.identity !== undefined && !sameHostWindowIdentity(cleanGrab.capture.identity, markerGrab.capture.identity)) {
+      return { success: false, error: 'the Studio window identity changed while locating the viewport; retry the capture' };
+    }
+    if (cleanGrab.capture.width !== markerGrab.capture.width || cleanGrab.capture.height !== markerGrab.capture.height) {
+      this.hostViewportRects.delete(cacheKey);
+      return { success: false, error: 'the Studio window was resized while locating the viewport; retry the capture' };
+    }
+    this.hostViewportRects.set(cacheKey, {
+      rect: located.rect,
+      identity: markerGrab.capture.identity,
+      windowWidth: markerGrab.capture.width,
+      windowHeight: markerGrab.capture.height,
+      viewportWidth,
+      viewportHeight,
+      cachedAt: Date.now(),
+    });
+    // A Studio missing from the registry is named by the window that showed
+    // its markers, so later captures go host-first.
+    const windowProcessId = markerGrab.capture.identity?.processId;
+    if (processId === undefined && windowProcessId !== undefined) {
+      this.hostCaptureProcessIds.set(instanceId, { processId: windowProcessId, cachedAt: Date.now(), discovered: true });
+    }
+    return {
+      success: true,
+      response: this._hostResponseFromCrop(cleanGrab.capture.rgba, cleanGrab.capture.width, cleanGrab.capture.height, located.rect, viewportWidth, viewportHeight),
+    };
+  }
+
+  private _hostResponseFromCrop(
+    rgba: Buffer,
+    width: number,
+    height: number,
+    rect: ViewportRect,
+    viewportWidth: number,
+    viewportHeight: number,
+  ): RawImageCaptureResponse {
+    const cropped = cropToViewport(rgba, width, height, rect, viewportWidth, viewportHeight);
+    return {
+      success: true,
+      encoding: 'rgba8',
+      source: 'host-window',
+      width: cropped.width,
+      height: cropped.height,
+      nativeWidth: viewportWidth,
+      nativeHeight: viewportHeight,
+      data: cropped.rgba.toString('base64'),
+    };
+  }
+
+  async captureScreenshot(instance_id?: string, format?: string, quality?: number, sequence: ScreenshotSequenceOptions = {}) {
+    const frames = sequence.frames ?? 1;
+    if (!Number.isInteger(frames) || frames < 1 || frames > MAX_SCREENSHOT_FRAMES) {
+      throw new Error(`frames must be an integer from 1 to ${MAX_SCREENSHOT_FRAMES}`);
+    }
+    const intervalMs = sequence.interval_ms ?? DEFAULT_SCREENSHOT_INTERVAL_MS;
+    if (!Number.isInteger(intervalMs) || intervalMs < 0 || intervalMs > MAX_SCREENSHOT_INTERVAL_MS) {
+      throw new Error(`interval_ms must be an integer from 0 to ${MAX_SCREENSHOT_INTERVAL_MS}`);
+    }
+    if ((frames - 1) * intervalMs > MAX_SCREENSHOT_SEQUENCE_MS) {
+      throw new Error(`frames x interval_ms spans ${(frames - 1) * intervalMs}ms; keep (frames - 1) * interval_ms within ${MAX_SCREENSHOT_SEQUENCE_MS}ms`);
+    }
+    const fmt: 'jpeg' | 'png' = format === 'png' ? 'png' : 'jpeg';
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const { instanceId, clientRole } = this._resolveRuntime(instance_id);
+    const targetRole = clientRole ?? 'edit';
+
+    if (frames === 1 && !sequence.grid) {
+      const capture = await this._captureViewportImage(instanceId, targetRole, fmt, quality);
+      if (!capture.success) {
+        return this._textResult({ error: capture.error, studioFastPathUnavailable: capture.studioFastPathUnavailable });
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              width: capture.width,
+              height: capture.height,
+              format: capture.format,
+              mimeType: capture.mimeType,
+              ...(capture.quality === undefined ? {} : { quality: capture.quality }),
+              message: capture.message,
+              source: capture.source,
+              studioFastPathUnavailable: capture.studioFastPathUnavailable,
+            }),
+          },
+          {
+            type: 'image',
+            data: capture.data,
+            mimeType: capture.mimeType,
+          },
+        ],
+      };
+    }
+
+    // A contact sheet is built from raw RGBA frames: Studio-encoded PNGs would
+    // have to be decoded again, and that decoder downsizes large images. The
+    // sheet is re-encoded in the requested format anyway.
+    const encoding = sequence.grid || fmt === 'jpeg' ? 'rgba8' : 'png';
+    const captured = await this._withViewportQueue(instanceId, () =>
+      this._captureViewportFramesNow(instanceId, targetRole, encoding, frames, intervalMs));
+    if (!captured.success) {
+      return this._textResult({ error: captured.error, studioFastPathUnavailable: captured.studioFastPathUnavailable });
+    }
+    const timeline = captured.frames.map(({ capture, atMs }, index) => ({
+      frame: index + 1,
+      atMs,
+      width: capture.response.width,
+      height: capture.response.height,
+      source: capture.response.source,
+    }));
+    const notes = [...new Set(captured.frames.map(({ capture }) => capture.hostNote).filter(Boolean))].join('');
+    const studioFastPathUnavailable = captured.frames.find(({ capture }) => capture.studioFastPathUnavailable)?.capture.studioFastPathUnavailable;
+
+    if (sequence.grid) {
+      let sheet: ContactSheet;
+      try {
+        sheet = composeContactSheet(captured.frames.map(({ capture }) => (
+          { width: capture.response.width ?? 0, height: capture.response.height ?? 0, rgba: Buffer.from(capture.response.data ?? '', 'base64') })));
+      } catch (error) {
+        return this._textResult({ error: `Could not compose the contact sheet: ${errorMessage(error)}` });
+      }
+      const encoded = this._encodeViewportCapture({
+        success: true,
+        response: { encoding: 'rgba8', source: 'contact-sheet', width: sheet.width, height: sheet.height, data: sheet.rgba.toString('base64') },
+        hostNote: '',
+      }, fmt, quality, MAX_INLINE_IMAGE_BYTES);
+      if (!encoded.success) return this._textResult({ error: encoded.error });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              frames: timeline,
+              grid: { columns: sheet.columns, rows: sheet.rows, width: sheet.width, height: sheet.height, tileWidth: sheet.tileWidth, tileHeight: sheet.tileHeight },
+              format: encoded.format,
+              mimeType: encoded.mimeType,
+              ...(encoded.quality === undefined ? {} : { quality: encoded.quality }),
+              message:
+                `Contact sheet of ${frames} frames ${intervalMs}ms apart: ${sheet.columns}x${sheet.rows} tiles of ` +
+                `${sheet.tileWidth}x${sheet.tileHeight}px, numbered left to right then top to bottom${encoded.note}. Tiles are ` +
+                'scaled, so take simulate_mouse_input coordinates from a single-frame capture, not from this sheet.' + notes,
+              studioFastPathUnavailable,
+            }),
+          },
+          { type: 'image', data: encoded.data, mimeType: encoded.mimeType },
+        ],
+      };
+    }
+
+    // Separate images share the inline budget.
+    const budget = Math.floor(MAX_INLINE_IMAGE_BYTES / frames);
+    const images: EncodedViewportImage[] = [];
+    for (const [index, { capture }] of captured.frames.entries()) {
+      // Host-capture notes are reported once for the whole sequence below.
+      const encoded = this._encodeViewportCapture({ ...capture, hostNote: '' }, fmt, quality, budget);
+      if (!encoded.success) {
+        return this._textResult({ error: `frame ${index + 1} of ${frames}: ${encoded.error} Pass grid: true to get one contact sheet instead.` });
+      }
+      images.push(encoded);
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            frames: timeline,
+            format: fmt,
+            mimeType: images[0].mimeType,
+            message: `${frames} frames ${intervalMs}ms apart follow in order. Frame 1: ${images[0].message}` + notes,
+            studioFastPathUnavailable,
+          }),
+        },
+        ...images.map((image) => ({ type: 'image' as const, data: image.data, mimeType: image.mimeType })),
+      ],
+    };
+  }
+
+  // capture_video records the viewport on the MCP host (see video-recorder.ts)
+  // and answers with the MP4 path plus a storyboard image the agent can read.
+  async captureVideo(request: Record<string, unknown> = {}, instance_id?: string) {
+    const action = request.action ?? 'record';
+    if (!isVideoAction(action)) {
+      throw new Error(`action must be one of ${VIDEO_ACTIONS.join(', ')}`);
+    }
+    if (action === 'storyboard') return await this._videoStoryboard(request);
+    for (const key of ['input_path', 'start_ms', 'end_ms']) {
+      if (request[key] !== undefined) throw new Error(`${key} is only used with action="storyboard"`);
+    }
+
+    if (action === 'stop') {
+      const recording = this._activeVideoRecording(instance_id);
+      const frames = clampedInteger(request.frames, 'frames', 0, VIDEO_MAX_STORYBOARD_FRAMES, recording.storyboardFrames);
+      this.videoRecordings.delete(recording.instanceId);
+      const exit = recording.exit ?? await recording.process.stop();
+      return await this._finishVideo(action, recording, exit, frames);
+    }
+
+    if (action === 'start' && request.duration_ms !== undefined) {
+      throw new Error(`duration_ms is only used with action="record"; action="start" records until action="stop" (at most ${VIDEO_START_MAX_DURATION_MS} ms)`);
+    }
+    const storyboardFrames = clampedInteger(request.frames, 'frames', 0, VIDEO_MAX_STORYBOARD_FRAMES, VIDEO_DEFAULT_STORYBOARD_FRAMES);
+    const fps = clampedInteger(request.fps, 'fps', 1, VIDEO_MAX_FPS, VIDEO_DEFAULT_FPS);
+    const durationMs = clampedInteger(request.duration_ms, 'duration_ms', VIDEO_MIN_DURATION_MS, VIDEO_MAX_DURATION_MS, VIDEO_DEFAULT_DURATION_MS);
+    // For record the encoder's own limit is only a backstop; record stops it on time.
+    const maxDurationMs = action === 'record' ? durationMs + 10_000 : VIDEO_START_MAX_DURATION_MS;
+    const outputPath = request.output_path;
+    if (outputPath !== undefined && (typeof outputPath !== 'string' || !outputPath.toLowerCase().endsWith('.mp4'))) {
+      throw new Error('output_path must be a path ending in .mp4');
+    }
+
+    const started = await this._startVideoRecording(instance_id, { fps, maxDurationMs, storyboardFrames, outputPath });
+    if (!started.ok) return this._textResult({ action, error: started.error });
+    const { recording, width, height } = started;
+
+    if (action === 'start') {
+      return this._textResult({
+        action,
+        recording: true,
+        target: recording.targetRole,
+        video: { path: recording.outputPath, fps, width, height, encoder: recording.encoder, source: recording.source },
+        max_duration_ms: maxDurationMs,
+        message:
+          'Recording the Studio viewport. Trigger the scene now (for example with execute_luau, eval_client_runtime, ' +
+          `or simulated input), then call capture_video action="stop". It stops itself after ${maxDurationMs} ms.`,
+      });
+    }
+
+    const remaining = Math.max(0, recording.startedAt + durationMs - Date.now());
+    await settledWithin(recording.process.done, remaining);
+    if (this.videoRecordings.get(recording.instanceId) === recording) this.videoRecordings.delete(recording.instanceId);
+    const exit = recording.exit ?? await recording.process.stop();
+    return await this._finishVideo(action, recording, exit, storyboardFrames);
+  }
+
+  private _activeVideoRecording(instance_id?: string): ActiveVideoRecording {
+    if (instance_id !== undefined) {
+      const key = this.bridge.resolveConnectedInstanceId(instance_id) ?? instance_id;
+      const recording = this.videoRecordings.get(key) ?? this.videoRecordings.get(instance_id);
+      if (!recording) {
+        throw new Error(`No capture_video recording is active for instance_id "${instance_id}". Start one with action="start".`);
+      }
+      return recording;
+    }
+    const recordings = [...this.videoRecordings.values()];
+    if (recordings.length === 1) return recordings[0];
+    if (recordings.length === 0) throw new Error('No capture_video recording is active. Start one with action="start".');
+    throw new Error(`Several capture_video recordings are active (${recordings.map((r) => r.instanceId).join(', ')}); pass instance_id.`);
+  }
+
+  private async _startVideoRecording(
+    instance_id: string | undefined,
+    options: { fps: number; maxDurationMs: number; storyboardFrames: number; outputPath?: string },
+  ): Promise<{ ok: true; recording: ActiveVideoRecording; width: number; height: number } | { ok: false; error: string }> {
+    const unsupported = videoRecordingUnsupportedReason();
+    if (unsupported) return { ok: false, error: unsupported };
+    if (isHostCaptureDisabled()) {
+      return { ok: false, error: 'video recording reads the Studio window, and host window capture is disabled by ROBLOX_STUDIO_HOST_CAPTURE' };
+    }
+    const refresh = this.bridge.refreshTopologyForRouting();
+    if (refresh) await refresh;
+    const { instanceId, clientRole } = this._resolveRuntime(instance_id);
+    const targetRole = clientRole ?? 'edit';
+    const existing = this.videoRecordings.get(instanceId);
+    if (this.videoStarting.has(instanceId) || (existing && existing.exit === undefined)) {
+      return {
+        ok: false,
+        error: `A capture_video recording is already running for this Studio${existing ? ` (${existing.outputPath})` : ''}. Call action="stop" first.`,
+      };
+    }
+    this.videoStarting.add(instanceId);
+    try {
+      const probe = await this.videoRecorder.probe();
+      if (!probe.ok) return { ok: false, error: probe.error };
+      const outputPath = path.resolve(options.outputPath ?? defaultVideoPath());
+      await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+      if (options.outputPath === undefined) await pruneDefaultVideos(path.dirname(outputPath));
+
+      const located = await this._withViewportQueue(
+        instanceId, () => this._locateVideoViewport(instanceId, targetRole, probe.ffmpegPath, probe.sources),
+      );
+      if (!located.success) return { ok: false, error: `Could not locate the Studio viewport: ${located.error}` };
+
+      const encoderProcess = this.videoRecorder.start({
+        ffmpegPath: probe.ffmpegPath,
+        encoder: probe.encoder,
+        source: located.source,
+        windowId: located.windowId,
+        x11Session: located.x11Session,
+        crop: located.rect,
+        frameWidth: located.frameWidth,
+        frameHeight: located.frameHeight,
+        fps: options.fps,
+        maxDurationMs: options.maxDurationMs,
+        outputPath,
+      });
+      const recording: ActiveVideoRecording = {
+        instanceId,
+        targetRole,
+        outputPath,
+        ffmpegPath: probe.ffmpegPath,
+        encoder: probe.encoder,
+        source: located.source,
+        fps: options.fps,
+        maxDurationMs: options.maxDurationMs,
+        storyboardFrames: options.storyboardFrames,
+        startedAt: Date.now(),
+        process: encoderProcess,
+      };
+      void encoderProcess.done.then((exit) => { recording.exit = exit; });
+      this.videoRecordings.set(instanceId, recording);
+      // A rejected window handle or encoder fails within moments; report it now
+      // rather than after the agent has played the whole scene.
+      const early = await settledWithin(encoderProcess.done, this.videoStartGraceMs);
+      if (early !== undefined) {
+        if (this.videoRecordings.get(instanceId) === recording) this.videoRecordings.delete(instanceId);
+        return {
+          ok: false,
+          error: early.ok ? 'ffmpeg stopped right after starting; nothing was recorded' : `Could not record the Studio window: ${early.error}`,
+        };
+      }
+      return { ok: true, recording, width: located.rect.width - (located.rect.width % 2), height: located.rect.height - (located.rect.height % 2) };
+    } finally {
+      this.videoStarting.delete(instanceId);
+    }
+  }
+
+  // Finds the Studio window and the viewport rect inside the frames the
+  // recorder will see. The markers are drawn and grabbed through the same
+  // capture source as the recording, so no DPI conversion is involved.
+  private async _locateVideoViewport(
+    instanceId: string,
+    targetRole: string,
+    ffmpegPath: string,
+    sources: CaptureSource[],
+  ): Promise<VideoViewportLocation> {
+    // Windows and WSL identify the window up front (their helper rejects
+    // ambiguous matches). On native Linux several Studio windows can share a
+    // display (a multiplayer test), so the window is chosen once the markers
+    // are shown, by which one shows them; no markers are drawn without a
+    // Studio on an X display.
+    let identity: HostWindowIdentity | undefined;
+    if (isNativeLinuxHost()) {
+      const unavailable = linuxHostCaptureUnavailableReason();
+      if (unavailable !== undefined) return { success: false, error: unavailable };
+    } else {
+      const window = await this.hostWindowCapture(this._hostCaptureTitleHint(instanceId));
+      if (!window.ok) return { success: false, error: window.error };
+      identity = window.capture.identity;
+      if (identity === undefined) return { success: false, error: 'the host window capture did not identify the Studio window' };
+    }
+
+    let prepared: ViewportMarkerResponse | undefined;
+    let result: VideoViewportLocation;
+    try {
+      prepared = await this._callViewportMarkers('prepare', targetRole, instanceId);
+      if (prepared.error || !prepared.captureId) {
+        result = { success: false, error: prepared.error ?? 'the Studio plugin could not prepare viewport markers (update the plugin)' };
+      } else if (prepared.viewportChanged) {
+        // prepare fitted a scaled simulated device to the window; finish restores
+        // the old scaling, which would move the viewport out from under the crop.
+        result = {
+          success: false,
+          error:
+            'device emulation is not using Fit to Window scaling, so the viewport would move once markers are removed. ' +
+            'Call set_device_simulator with scalingMode="FitToWindow" (or stopSimulation=true), then record again.',
+        };
+      } else {
+        result = await this._locateVideoViewportWithMarkers(instanceId, targetRole, prepared.captureId, ffmpegPath, identity, sources);
+      }
+    } catch (error) {
+      result = { success: false, error: errorMessage(error) };
+    } finally {
+      if (prepared?.captureId) {
+        try {
+          const restored = await this._callViewportMarkers('finish', targetRole, instanceId, prepared.captureId);
+          if (restored.error) result = { success: false, error: `could not restore the Studio viewport: ${restored.error}` };
+          else if (restored.stale || !restored.success) result = { success: false, error: 'the viewport marker transaction expired; retry' };
+        } catch (error) {
+          result = { success: false, error: `could not restore the Studio viewport: ${errorMessage(error)}` };
+        }
+      }
+    }
+    return result;
+  }
+
+  private async _locateVideoViewportWithMarkers(
+    instanceId: string,
+    targetRole: string,
+    captureId: string,
+    ffmpegPath: string,
+    preidentified: HostWindowIdentity | undefined,
+    sources: CaptureSource[],
+  ): Promise<VideoViewportLocation> {
+    const shown = await this._callViewportMarkers('show', targetRole, instanceId, captureId);
+    if (shown.error || !shown.viewportWidth || !shown.viewportHeight) {
+      return { success: false, error: `could not draw viewport markers: ${shown.error ?? 'no viewport size reported'}` };
+    }
+    // Each source that can read the window is tried until its frame shows the
+    // markers: the marker frame and the recording must come from the same
+    // capture path, and one path can miss markers another sees.
+    const markerHint: ViewportMarkerHint = {
+      viewportWidth: shown.viewportWidth,
+      viewportHeight: shown.viewportHeight,
+      markerSize: shown.markerSize ?? 12,
+      markerLayout: shown.markerLayout === 'edges' ? 'edges' : 'corners',
+    };
+    let identity = preidentified;
+    let found: { source: CaptureSource; rect: ViewportRect; frameWidth: number; frameHeight: number } | undefined;
+    // Grab errors stay strings; unread frames are saved once the markers are gone.
+    const failures: Array<string | { source: CaptureSource; frame: { width: number; height: number; rgba: Buffer }; error: string }> = [];
+    let hidden: ViewportMarkerResponse;
+    try {
+      if (identity === undefined) {
+        // Native Linux: the Studio window that shows the markers, as for screenshots.
+        const window = await this.hostWindowCapture(this._hostCaptureTitleHint(instanceId), undefined, {
+          processId: await this._hostCaptureProcessId(instanceId),
+          accept: (capture) => !('error' in findViewportRect(capture.rgba, capture.width, capture.height, markerHint)),
+        });
+        if (!window.ok) failures.push(window.error);
+        else if (window.capture.identity === undefined) failures.push('the host window capture did not identify the Studio window');
+        else identity = window.capture.identity;
+      }
+      if (identity !== undefined) {
+        for (const candidate of sources) {
+          let frame: { width: number; height: number; rgba: Buffer };
+          try {
+            frame = await this.videoRecorder.grabWindowFrame(ffmpegPath, identity.windowId, candidate, identity.x11Session);
+          } catch (error) {
+            failures.push(errorMessage(error));
+            continue;
+          }
+          const located = findViewportRect(frame.rgba, frame.width, frame.height, markerHint);
+          if ('rect' in located) {
+            found = { source: candidate, rect: located.rect, frameWidth: frame.width, frameHeight: frame.height };
+            break;
+          }
+          failures.push({ source: candidate, frame, error: located.error });
+        }
+      }
+    } finally {
+      hidden = await this._callViewportMarkers('hide', targetRole, instanceId, captureId);
+    }
+    if (hidden.error) return { success: false, error: `could not hide viewport markers: ${hidden.error}` };
+    if (identity && found) return { success: true, windowId: identity.windowId, x11Session: identity.x11Session, ...found };
+    if (failures.every((failure) => typeof failure === 'string')) {
+      return { success: false, error: failures.join('; ') || 'no capture source is available' };
+    }
+    const reasons = failures.map((failure) => {
+      if (typeof failure === 'string') return failure;
+      const saved = saveViewportMarkerFrame(failure.frame.rgba, failure.frame.width, failure.frame.height, failure.source);
+      return `${failure.source} frame: ${failure.error}${saved ? `; marker frame saved to ${saved}` : ''}`;
+    }).join('; ');
+    return {
+      success: false,
+      error:
+        `${reasons}. capture_screenshot reads the window another way and may still work. Keep the Studio viewport visible and ` +
+        'uncovered; with a simulated device, try a larger Studio window, another device, or set_device_simulator stopSimulation=true, then record again.',
+    };
+  }
+
+  private async _finishVideo(action: VideoAction, recording: ActiveVideoRecording, exit: VideoRecordingExit, frames: number) {
+    const video: Record<string, unknown> = {
+      path: recording.outputPath, fps: recording.fps, encoder: recording.encoder, source: recording.source,
+    };
+    const body: Record<string, unknown> = { action, target: recording.targetRole, video };
+    if (!exit.ok) return this._textResult({ ...body, error: `The recording failed: ${exit.error}` });
+    let info: MediaInfo;
+    try {
+      info = await this.videoRecorder.mediaInfo(recording.ffmpegPath, recording.outputPath);
+    } catch (error) {
+      return this._textResult({ ...body, error: errorMessage(error) });
+    }
+    const stats = await fs.promises.stat(recording.outputPath).catch(() => undefined);
+    Object.assign(video, {
+      duration_ms: Math.round(info.durationSeconds * 1000),
+      width: info.width,
+      height: info.height,
+      ...(stats ? { bytes: stats.size } : {}),
+    });
+    if (action === 'stop' && exit.reason === 'duration_limit') {
+      body.stopped_by = 'max_duration';
+      body.message = `The recording reached its ${recording.maxDurationMs} ms limit and stopped itself before action="stop".`;
+    }
+    return await this._videoResultWithStoryboard(body, recording.ffmpegPath, recording.outputPath, info, 0, info.durationSeconds, frames);
+  }
+
+  private async _videoStoryboard(request: Record<string, unknown>) {
+    const inputPath = request.input_path;
+    if (typeof inputPath !== 'string' || inputPath === '') {
+      throw new Error('input_path is required for action="storyboard": a video.path from an earlier capture_video result');
+    }
+    const frames = clampedInteger(request.frames, 'frames', 1, VIDEO_MAX_STORYBOARD_FRAMES, VIDEO_DEFAULT_STORYBOARD_FRAMES);
+    const resolved = path.resolve(inputPath);
+    const ffmpegPath = ffmpegCommand();
+    const info = await this.videoRecorder.mediaInfo(ffmpegPath, resolved);
+    const durationMs = Math.round(info.durationSeconds * 1000);
+    const startMs = clampedInteger(request.start_ms, 'start_ms', 0, durationMs, 0);
+    const endMs = clampedInteger(request.end_ms, 'end_ms', 0, durationMs, durationMs);
+    if (endMs <= startMs) {
+      throw new Error(`end_ms must be after start_ms within the ${durationMs} ms video`);
+    }
+    const body: Record<string, unknown> = {
+      action: 'storyboard',
+      video: { path: resolved, duration_ms: durationMs, width: info.width, height: info.height },
+      window_ms: { start: startMs, end: endMs },
+    };
+    return await this._videoResultWithStoryboard(body, ffmpegPath, resolved, info, startMs / 1000, endMs / 1000, frames);
+  }
+
+  private async _videoResultWithStoryboard(
+    body: Record<string, unknown>,
+    ffmpegPath: string,
+    inputPath: string,
+    info: MediaInfo,
+    startSeconds: number,
+    endSeconds: number,
+    frames: number,
+  ) {
+    if (frames <= 0) return this._textResult(body);
+    try {
+      const sheet = await this.videoRecorder.storyboard({
+        ffmpegPath, inputPath, info, startSeconds, endSeconds, frames, maxWidth: VIDEO_STORYBOARD_MAX_WIDTH,
+      });
+      if (sheet.jpeg.length > MAX_INLINE_IMAGE_BYTES) throw new Error(`the storyboard is ${sheet.jpeg.length} bytes, over the inline image limit`);
+      body.storyboard = {
+        frames: sheet.timesSeconds.length,
+        columns: sheet.columns,
+        rows: sheet.rows,
+        width: sheet.width,
+        height: sheet.height,
+        times_ms: sheet.timesSeconds.map((t) => Math.round(t * 1000)),
+      };
+      const guide =
+        `The image is a ${sheet.columns}x${sheet.rows} storyboard read left to right, top to bottom; storyboard.times_ms ` +
+        'gives each frame\'s time in the video. To inspect a span closely, call capture_video action="storyboard" ' +
+        'with input_path, start_ms, and end_ms instead of recording again.';
+      body.message = typeof body.message === 'string' ? `${body.message} ${guide}` : guide;
+      return {
+        content: [
+          { type: 'text', text: JSON.stringify(body) },
+          { type: 'image', data: sheet.jpeg.toString('base64'), mimeType: 'image/jpeg' },
+        ],
+      };
+    } catch (error) {
+      body.storyboard_error = errorMessage(error);
+      return this._textResult(body);
+    }
+  }
+}

@@ -1,0 +1,763 @@
+// Host-side Studio window capture.
+//
+// Roblox's in-engine capture APIs cannot always see the play viewport:
+// StudioCaptureService refuses the play client (CanCaptureScreenshot() is
+// false and RequestScreenshotPermissionAsync raises "Feature not supported
+// yet"), and CaptureService:CaptureScreenshot returns a fully black frame from
+// the play client on some Studio builds (observed with the Vulkan renderer),
+// while the edit DataModel is simply not rendered during a playtest. None of
+// that depends on the Studio window being focused: the client keeps rendering
+// at full rate behind other windows.
+//
+// So when Studio hands back nothing usable, the MCP server grabs the Studio
+// window itself through the host OS. On Windows PrintWindow(PW_RENDERFULLCONTENT)
+// asks DWM for the window's composited surface, which works while the window
+// is behind other windows (only a minimized window has no surface). The plugin
+// pins four magenta squares to the viewport corners so the window capture can
+// be cropped to exactly the viewport — the coordinate space simulate_mouse_input
+// expects — without guessing at Studio's dock layout or the DPI scale.
+// On macOS, ScreenCaptureKit captures only the selected Studio window after
+// verifying existing Screen Recording permission and its stable window identity.
+// On Linux, Studio runs under Wine on an X display; host-capture-linux.ts finds
+// that display from the Studio process and grabs the window through Xlib. Under
+// Wine none of Studio's own capture paths read the play viewport reliably, so
+// Linux tries the host grab first and Studio's capture only as the fallback.
+import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { captureMacStudioWindow, prepareMacHostCapture } from './host-capture-macos.js';
+import { captureLinuxStudioWindow, hasLinuxStudioX11Session, LINUX_NO_STUDIO_DISPLAY_ERROR } from './host-capture-linux.js';
+import type { X11Session } from './host-capture-linux.js';
+import { rgbaToPng } from './png-encoder.js';
+
+// macOS uses the app bundle ID; Windows uses the verified executable name;
+// Linux uses `x11` plus the X display name, and carries that display and its
+// cookie (x11Session) so the video recorder can open the window there.
+export type HostWindowIdentity = { windowId: number; processId: number; bundleIdentifier: string; x11Session?: X11Session };
+
+// Linux only: processId is the Studio process that owns the target viewport
+// (its X display is searched first); accept picks among several Studio windows
+// on a display, e.g. the separate server and client windows of a multiplayer test.
+export type HostCaptureOptions = {
+  processId?: number;
+  accept?: (capture: HostWindowCapture) => boolean;
+};
+
+export type HostWindowCapture = {
+  width: number;
+  height: number;
+  rgba: Buffer;
+  title: string;
+  identity?: HostWindowIdentity;
+};
+
+export type HostCaptureResult =
+  | { ok: true; capture: HostWindowCapture }
+  | { ok: false; error: string };
+
+export type ViewportRect = { x: number; y: number; width: number; height: number };
+
+export type ViewportMarkerHint = {
+  viewportWidth: number;
+  viewportHeight: number;
+  markerSize: number;
+  // Where the plugin pins the markers: the middle of each viewport edge, or
+  // (older plugins) the corners.
+  markerLayout?: 'corners' | 'edges';
+};
+
+const HOST_CAPTURE_TIMEOUT_MS = 20_000;
+// Marker colour is pure magenta; allow for colour management / compositor rounding.
+const MARKER_MIN_RB = 200;
+const MARKER_MAX_G = 60;
+// The marker bounding box must match the viewport within this ratio, or be a
+// consistent DPI scale of it (same factor on both axes within this tolerance).
+const MARKER_SCALE_TOLERANCE = 0.03;
+// Blobs searched for the four corners; more than this is noise, not markers.
+const MARKER_MAX_CANDIDATES = 128;
+const MARKER_MAX_REPORTED_BLOBS = 8;
+const MARKER_DIAGNOSTIC_PREFIX = 'viewport-markers-';
+const MARKER_DIAGNOSTICS_KEPT = 5;
+
+export function isHostCaptureDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = (env.ROBLOX_STUDIO_HOST_CAPTURE ?? '').trim().toLowerCase();
+  return value === '0' || value === 'false' || value === 'off';
+}
+
+// WSL runs this server as a Linux process, but Studio is a Windows window: the
+// Windows helpers (powershell.exe, ffmpeg.exe) reach it through WSL interop.
+export const WSL_WINDOWS_POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+
+let detectedWslWindowsHost: boolean | undefined;
+
+function detectWslWindowsHost(): boolean {
+  if (detectedWslWindowsHost !== undefined) return detectedWslWindowsHost;
+  let release = '';
+  try {
+    release = fs.readFileSync('/proc/sys/kernel/osrelease', 'utf8');
+  } catch {
+    // Not Linux, or /proc is unavailable.
+  }
+  detectedWslWindowsHost = /microsoft|wsl/i.test(release) && fs.existsSync(WSL_WINDOWS_POWERSHELL);
+  return detectedWslWindowsHost;
+}
+
+// Injection seams: tests pin whether a Linux host is WSL with Windows interop,
+// and whether a native Linux host runs a Studio on an X display.
+export const hostEnvironment = { detectWslWindowsHost, hasLinuxStudioDisplay: () => hasLinuxStudioX11Session() };
+
+export function isWslWindowsHost(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'linux' && hostEnvironment.detectWslWindowsHost();
+}
+
+// Native Linux (not WSL): Studio runs under Wine and is grabbed through X11.
+export function isNativeLinuxHost(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'linux' && !isWslWindowsHost(platform);
+}
+
+// Native Linux without a Studio on an X display (a container, a remote
+// server, WSL whose interop detection failed) cannot grab any window, so the
+// caller must not start the plugin's marker transaction for it.
+export function linuxHostCaptureUnavailableReason(platform: NodeJS.Platform = process.platform): string | undefined {
+  return isNativeLinuxHost(platform) && !hostEnvironment.hasLinuxStudioDisplay() ? LINUX_NO_STUDIO_DISPLAY_ERROR : undefined;
+}
+
+export function isHostCaptureSupported(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'win32' || platform === 'darwin' || platform === 'linux';
+}
+
+// Native Linux (not WSL) runs Studio under Wine, where the host grab is the reliable path.
+export function isHostCapturePreferred(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): boolean {
+  return isNativeLinuxHost(platform) && !isHostCaptureDisabled(env) && hostEnvironment.hasLinuxStudioDisplay();
+}
+
+export function hostCaptureUnsupportedReason(platform: NodeJS.Platform = process.platform): string {
+  return `host window capture is only implemented on Windows, WSL with Windows interop, macOS and Linux/X11 (this is ${platform})`;
+}
+
+// Windows programs started from WSL receive only the variables WSLENV names.
+// `/w` limits an entry to WSL -> Windows launches; `/p` also translates a WSL
+// path into its Windows form.
+export function withWslEnv(env: NodeJS.ProcessEnv, entries: string[]): NodeJS.ProcessEnv {
+  const existing = (env.WSLENV ?? '').split(':').filter((entry) => entry.length > 0);
+  return { ...env, WSLENV: [...existing, ...entries].join(':') };
+}
+
+export async function prepareHostWindowCapture(): Promise<void> {
+  if (process.platform === 'darwin' && !isHostCaptureDisabled()) await prepareMacHostCapture();
+}
+
+// True when every pixel has the same RGB value — what Studio returns when the
+// capture path had no rendered frame to read (black, or occasionally a flat
+// clear colour). A real viewport always has some variation.
+export function isUniformFrame(rgba: Buffer, width: number, height: number): boolean {
+  const pixels = width * height;
+  if (pixels <= 0 || rgba.length < pixels * 4) return false;
+  const r = rgba[0];
+  const g = rgba[1];
+  const b = rgba[2];
+  for (let i = 0; i < pixels; i++) {
+    const o = i * 4;
+    if (rgba[o] !== r || rgba[o + 1] !== g || rgba[o + 2] !== b) return false;
+  }
+  return true;
+}
+
+function isMarkerPixel(rgba: Buffer, offset: number): boolean {
+  return rgba[offset] >= MARKER_MIN_RB && rgba[offset + 1] <= MARKER_MAX_G && rgba[offset + 2] >= MARKER_MIN_RB;
+}
+
+type MarkerBlob = { x: number; y: number; width: number; height: number; pixels: number };
+
+// 8-connected runs of marker pixels. Only the first `limit` blobs are kept,
+// but every marker pixel and blob is counted (and bounded) for the fallback
+// and the failure report.
+function findMarkerBlobs(
+  rgba: Buffer,
+  width: number,
+  height: number,
+  limit: number,
+): { pixels: number; count: number; blobs: MarkerBlob[]; bounds: ViewportRect } {
+  const visited = new Uint8Array(width * height);
+  const blobs: MarkerBlob[] = [];
+  const stack: number[] = [];
+  let pixels = 0;
+  let count = 0;
+  let boundsMinX = width;
+  let boundsMinY = height;
+  let boundsMaxX = -1;
+  let boundsMaxY = -1;
+  for (let start = 0; start < width * height; start++) {
+    if (visited[start] || !isMarkerPixel(rgba, start * 4)) continue;
+    visited[start] = 1;
+    stack.push(start);
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+    let blobPixels = 0;
+    while (stack.length > 0) {
+      const index = stack.pop()!;
+      const x = index % width;
+      const y = (index - x) / width;
+      blobPixels++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= height) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) continue;
+          const neighbour = ny * width + nx;
+          if (visited[neighbour] || !isMarkerPixel(rgba, neighbour * 4)) continue;
+          visited[neighbour] = 1;
+          stack.push(neighbour);
+        }
+      }
+    }
+    pixels += blobPixels;
+    count++;
+    boundsMinX = Math.min(boundsMinX, minX);
+    boundsMinY = Math.min(boundsMinY, minY);
+    boundsMaxX = Math.max(boundsMaxX, maxX);
+    boundsMaxY = Math.max(boundsMaxY, maxY);
+    if (blobs.length < limit) blobs.push({ x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1, pixels: blobPixels });
+  }
+  const bounds = { x: boundsMinX, y: boundsMinY, width: boundsMaxX - boundsMinX + 1, height: boundsMaxY - boundsMinY + 1 };
+  return { pixels, count, blobs, bounds };
+}
+
+// The box around every marker pixel, accepted when its corners are marker
+// pixels: markers merged with magenta game UI at a corner are not square blobs.
+function boundingBoxMarkers(rgba: Buffer, width: number, bounds: ViewportRect, markerSize: number): boolean {
+  const inset = Math.max(1, Math.floor(markerSize / 4));
+  const maxX = bounds.x + bounds.width - 1;
+  const maxY = bounds.y + bounds.height - 1;
+  if (bounds.width <= inset * 2 || bounds.height <= inset * 2) return false;
+  const corners: Array<[number, number]> = [
+    [bounds.x + inset, bounds.y + inset],
+    [maxX - inset, bounds.y + inset],
+    [bounds.x + inset, maxY - inset],
+    [maxX - inset, maxY - inset],
+  ];
+  return corners.every(([x, y]) => isMarkerPixel(rgba, (y * width + x) * 4));
+}
+
+// A marker is a filled square. Thin strips and lines of marker-coloured pixels
+// (seen in iPad Fit to Window frames) and large magenta areas are not.
+function isMarkerShaped(blob: MarkerBlob, markerSize: number): boolean {
+  const short = Math.min(blob.width, blob.height);
+  const long = Math.max(blob.width, blob.height);
+  return short >= 2 && short / long >= 0.6 && long <= Math.max(64, markerSize * 8) && blob.pixels >= 0.7 * blob.width * blob.height;
+}
+
+function similarMarkers(a: MarkerBlob, b: MarkerBlob): boolean {
+  const sizeA = Math.max(a.width, a.height);
+  const sizeB = Math.max(b.width, b.height);
+  return Math.abs(sizeA - sizeB) <= 2 || Math.max(sizeA, sizeB) / Math.min(sizeA, sizeB) <= 1.5;
+}
+
+function matchesViewportAspect(rect: ViewportRect, hint: ViewportMarkerHint): boolean {
+  const scaleX = rect.width / hint.viewportWidth;
+  const scaleY = rect.height / hint.viewportHeight;
+  return Math.abs(scaleX - scaleY) <= MARKER_SCALE_TOLERANCE * Math.max(scaleX, scaleY);
+}
+
+// The outermost set of four similar squares that sit at the corners of an
+// axis-aligned rectangle, preferring one with the reported viewport aspect.
+function findMarkerRectangle(candidates: MarkerBlob[], hint: ViewportMarkerHint): { rect: ViewportRect; aspectMatches: boolean } | undefined {
+  let best: { rect: ViewportRect; aspectMatches: boolean } | undefined;
+  for (const topLeft of candidates) {
+    for (const bottomRight of candidates) {
+      const right = bottomRight.x + bottomRight.width - 1;
+      const bottom = bottomRight.y + bottomRight.height - 1;
+      // Opposite corners must not overlap each other.
+      if (bottomRight.x < topLeft.x + topLeft.width || bottomRight.y < topLeft.y + topLeft.height) continue;
+      if (!similarMarkers(topLeft, bottomRight)) continue;
+      const tolerance = Math.max(2, Math.round(Math.max(topLeft.width, topLeft.height) / 4));
+      const near = (a: number, b: number) => Math.abs(a - b) <= tolerance;
+      const topRight = candidates.find((blob) => blob !== topLeft && blob !== bottomRight && similarMarkers(blob, topLeft)
+        && near(blob.y, topLeft.y) && near(blob.x + blob.width - 1, right));
+      const bottomLeft = candidates.find((blob) => blob !== topLeft && blob !== bottomRight && similarMarkers(blob, topLeft)
+        && near(blob.x, topLeft.x) && near(blob.y + blob.height - 1, bottom));
+      if (!topRight || !bottomLeft || topRight === bottomLeft) continue;
+      const minX = Math.min(topLeft.x, bottomLeft.x);
+      const minY = Math.min(topLeft.y, topRight.y);
+      const maxX = Math.max(right, topRight.x + topRight.width - 1);
+      const maxY = Math.max(bottom, bottomLeft.y + bottomLeft.height - 1);
+      const rect = { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+      const aspectMatches = matchesViewportAspect(rect, hint);
+      const better = best === undefined
+        || (aspectMatches && !best.aspectMatches)
+        || (aspectMatches === best.aspectMatches && rect.width * rect.height > best.rect.width * best.rect.height);
+      if (better) best = { rect, aspectMatches };
+    }
+  }
+  return best;
+}
+
+// Four similar squares at the middle of the viewport's edges: a left/right pair
+// sharing a centre row and a top/bottom pair sharing a centre column, each pair
+// centred on the other. Their outer edges are the viewport's edges.
+function findEdgeMarkerRectangle(candidates: MarkerBlob[], hint: ViewportMarkerHint): { rect: ViewportRect; aspectMatches: boolean } | undefined {
+  const centreX = (blob: MarkerBlob) => blob.x + (blob.width - 1) / 2;
+  const centreY = (blob: MarkerBlob) => blob.y + (blob.height - 1) / 2;
+  const tolerance = (a: MarkerBlob, b: MarkerBlob) => Math.max(2, Math.max(a.width, a.height, b.width, b.height) / 2);
+  type Pair = { first: MarkerBlob; second: MarkerBlob; centre: number; middle: number };
+  const horizontal: Pair[] = [];
+  const vertical: Pair[] = [];
+  for (const first of candidates) {
+    for (const second of candidates) {
+      if (first === second || !similarMarkers(first, second)) continue;
+      const tol = tolerance(first, second);
+      if (second.x >= first.x + first.width && Math.abs(centreY(first) - centreY(second)) <= tol) {
+        horizontal.push({ first, second, centre: (centreY(first) + centreY(second)) / 2, middle: (first.x + second.x + second.width - 1) / 2 });
+      }
+      if (second.y >= first.y + first.height && Math.abs(centreX(first) - centreX(second)) <= tol) {
+        vertical.push({ first, second, centre: (centreX(first) + centreX(second)) / 2, middle: (first.y + second.y + second.height - 1) / 2 });
+      }
+    }
+  }
+  let best: { rect: ViewportRect; aspectMatches: boolean } | undefined;
+  for (const sides of horizontal) {
+    for (const ends of vertical) {
+      if (new Set([sides.first, sides.second, ends.first, ends.second]).size !== 4) continue;
+      const tol = Math.max(tolerance(sides.first, sides.second), tolerance(ends.first, ends.second));
+      if (Math.abs(sides.middle - ends.centre) > tol || Math.abs(ends.middle - sides.centre) > tol) continue;
+      const rect = {
+        x: sides.first.x,
+        y: ends.first.y,
+        width: sides.second.x + sides.second.width - sides.first.x,
+        height: ends.second.y + ends.second.height - ends.first.y,
+      };
+      const aspectMatches = matchesViewportAspect(rect, hint);
+      const better = best === undefined
+        || (aspectMatches && !best.aspectMatches)
+        || (aspectMatches === best.aspectMatches && rect.width * rect.height > best.rect.width * best.rect.height);
+      if (better) best = { rect, aspectMatches };
+    }
+  }
+  return best;
+}
+
+function describeBlobs(count: number, blobs: MarkerBlob[]): string {
+  const largest = [...blobs].sort((a, b) => b.pixels - a.pixels).slice(0, MARKER_MAX_REPORTED_BLOBS);
+  const boxes = largest.map((blob) => `${blob.width}x${blob.height} at ${blob.x},${blob.y}`).join(', ');
+  return `${count} blob${count === 1 ? '' : 's'} (${boxes}${count > largest.length ? ', ...' : ''})`;
+}
+
+// Locates the viewport inside a window capture from the corner markers: the
+// four marker-shaped blobs that frame a rectangle of the viewport's aspect.
+// Other marker-coloured pixels (game UI, Studio chrome, thin strips) are
+// ignored. Returns a reason when no such rectangle is in the frame.
+export function findViewportRect(
+  rgba: Buffer,
+  width: number,
+  height: number,
+  hint: ViewportMarkerHint,
+): { rect: ViewportRect } | { error: string } {
+  const edges = hint.markerLayout === 'edges';
+  const expected = `expected four ${hint.markerSize} px squares at the ${edges ? 'middle of the edges' : 'corners'} of the ${hint.viewportWidth}x${hint.viewportHeight} viewport`;
+  const { pixels, count, blobs, bounds } = findMarkerBlobs(rgba, width, height, MARKER_MAX_CANDIDATES * 8);
+  if (pixels === 0) {
+    // The grab reads the window's own pixels, so other windows on top do not
+    // matter; a Studio tab in front of the place viewport does.
+    return {
+      error: `no viewport markers were visible in the Studio window capture (${width}x${height} frame; ${expected}; ` +
+        "if a script or plugin tab such as UI Labs is in front of the place's viewport tab, select the place tab and retry)",
+    };
+  }
+
+  const candidates = blobs.filter((blob) => isMarkerShaped(blob, hint.markerSize)).slice(0, MARKER_MAX_CANDIDATES);
+  const found = edges ? findEdgeMarkerRectangle(candidates, hint) : findMarkerRectangle(candidates, hint);
+  if (found?.aspectMatches) return { rect: found.rect };
+  // The box around every marker pixel only has marker corners in the corner layout.
+  const boxed = !edges && boundingBoxMarkers(rgba, width, bounds, hint.markerSize);
+  if (boxed && matchesViewportAspect(bounds, hint)) return { rect: bounds };
+
+  const seen = `${pixels} marker pixel${pixels === 1 ? '' : 's'} in ${describeBlobs(count, blobs)}, ${candidates.length} marker-shaped`;
+  const rect = found?.rect ?? (boxed ? bounds : undefined);
+  if (!rect) {
+    return { error: `viewport markers were found but do not form a rectangle: ${seen}; ${expected}` };
+  }
+  return {
+    error:
+      `viewport marker box ${rect.width}x${rect.height} at ${rect.x},${rect.y} does not match the reported ` +
+      `${hint.viewportWidth}x${hint.viewportHeight} viewport aspect (${seen})`,
+  };
+}
+
+export function viewportDiagnosticsDirectory(): string {
+  return path.join(os.tmpdir(), 'robloxstudio-mcp', 'capture-diagnostics');
+}
+
+// Keeps a frame whose markers could not be read so the failure can be looked
+// at. Only the newest few are kept; returns undefined when it cannot be saved,
+// since the capture error matters more than the diagnostic copy.
+export function saveViewportMarkerFrame(
+  rgba: Buffer,
+  width: number,
+  height: number,
+  label: string,
+  directory = viewportDiagnosticsDirectory(),
+  keep = MARKER_DIAGNOSTICS_KEPT,
+): string | undefined {
+  try {
+    fs.mkdirSync(directory, { recursive: true });
+    const previous = fs.readdirSync(directory)
+      .filter((name) => name.startsWith(MARKER_DIAGNOSTIC_PREFIX) && name.endsWith('.png'))
+      .sort();
+    for (const name of previous.slice(0, Math.max(0, previous.length - keep + 1))) {
+      fs.rmSync(path.join(directory, name), { force: true });
+    }
+    // Window captures can carry zero alpha, which would save an invisible image.
+    const opaque = Buffer.from(rgba.subarray(0, width * height * 4));
+    for (let offset = 3; offset < opaque.length; offset += 4) opaque[offset] = 255;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeLabel = label.replace(/[^A-Za-z0-9_-]/g, '');
+    const file = path.join(directory, `${MARKER_DIAGNOSTIC_PREFIX}${stamp}-${safeLabel}-${Math.random().toString(36).slice(2, 8)}.png`);
+    fs.writeFileSync(file, rgbaToPng(opaque, width, height));
+    return file;
+  } catch {
+    return undefined;
+  }
+}
+
+// findViewportRect for a live capture: a failure also saves the marker frame
+// and names it in the error.
+export function locateViewportInFrame(
+  rgba: Buffer,
+  width: number,
+  height: number,
+  hint: ViewportMarkerHint,
+  label: string,
+): { rect: ViewportRect } | { error: string } {
+  const located = findViewportRect(rgba, width, height, hint);
+  if ('rect' in located) return located;
+  const saved = saveViewportMarkerFrame(rgba, width, height, label);
+  return { error: saved ? `${located.error}; marker frame saved to ${saved}` : located.error };
+}
+
+// Crops the window capture to the viewport rect and resamples it to the
+// viewport's logical size so image pixels equal viewport coordinates even at
+// fractional display scaling. Only an exactly matching rect can be copied:
+// rounding by even one pixel must not change the restored coordinate space.
+export function cropToViewport(
+  rgba: Buffer,
+  width: number,
+  height: number,
+  rect: ViewportRect,
+  targetWidth: number,
+  targetHeight: number,
+): { width: number; height: number; rgba: Buffer } {
+  const x0 = Math.max(0, Math.min(width - 1, rect.x));
+  const y0 = Math.max(0, Math.min(height - 1, rect.y));
+  const srcW = Math.max(1, Math.min(rect.width, width - x0));
+  const srcH = Math.max(1, Math.min(rect.height, height - y0));
+
+  const exact = srcW === targetWidth && srcH === targetHeight;
+  const outW = targetWidth;
+  const outH = targetHeight;
+  const out = Buffer.alloc(outW * outH * 4);
+
+  if (exact) {
+    for (let y = 0; y < outH; y++) {
+      rgba.copy(out, y * outW * 4, ((y0 + y) * width + x0) * 4, ((y0 + y) * width + x0 + outW) * 4);
+    }
+    return { width: outW, height: outH, rgba: out };
+  }
+
+  // Bilinear resample from the source rect into the target size.
+  const sx = srcW / outW;
+  const sy = srcH / outH;
+  for (let y = 0; y < outH; y++) {
+    const fy = Math.min(srcH - 1, (y + 0.5) * sy - 0.5);
+    const iy = Math.max(0, Math.floor(fy));
+    const ny = Math.min(srcH - 1, iy + 1);
+    const wy = Math.max(0, fy - iy);
+    for (let x = 0; x < outW; x++) {
+      const fx = Math.min(srcW - 1, (x + 0.5) * sx - 0.5);
+      const ix = Math.max(0, Math.floor(fx));
+      const nx = Math.min(srcW - 1, ix + 1);
+      const wx = Math.max(0, fx - ix);
+      const o00 = ((y0 + iy) * width + x0 + ix) * 4;
+      const o10 = ((y0 + iy) * width + x0 + nx) * 4;
+      const o01 = ((y0 + ny) * width + x0 + ix) * 4;
+      const o11 = ((y0 + ny) * width + x0 + nx) * 4;
+      const dst = (y * outW + x) * 4;
+      for (let c = 0; c < 4; c++) {
+        const top = rgba[o00 + c] * (1 - wx) + rgba[o10 + c] * wx;
+        const bottom = rgba[o01 + c] * (1 - wx) + rgba[o11 + c] * wx;
+        out[dst + c] = Math.round(top * (1 - wy) + bottom * wy);
+      }
+    }
+  }
+  return { width: outW, height: outH, rgba: out };
+}
+
+// PowerShell program that finds the Studio window and dumps its client area
+// as raw 32-bit BGRA. Inputs arrive through environment variables so no
+// shell quoting is involved; the single JSON line on stdout is the result.
+export const WINDOWS_CAPTURE_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class McpStudioCapture {
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextLengthW(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+  delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  public class Candidate { public IntPtr Handle; public uint Pid; public string Title; }
+  public static List<Candidate> Find(string processName) {
+    var found = new List<Candidate>();
+    EnumWindows((hWnd, lParam) => {
+      if (!IsWindowVisible(hWnd)) return true;
+      int length = GetWindowTextLengthW(hWnd);
+      if (length <= 0) return true;
+      var sb = new StringBuilder(length + 1);
+      GetWindowTextW(hWnd, sb, sb.Capacity);
+      string title = sb.ToString();
+      if (!title.EndsWith("Roblox Studio", StringComparison.Ordinal)) return true;
+      uint pid;
+      GetWindowThreadProcessId(hWnd, out pid);
+      try {
+        var proc = System.Diagnostics.Process.GetProcessById((int)pid);
+        if (!string.Equals(proc.ProcessName, processName, StringComparison.OrdinalIgnoreCase)) return true;
+      } catch { return true; }
+      found.Add(new Candidate { Handle = hWnd, Pid = pid, Title = title });
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+}
+"@
+function Emit($obj) { Write-Output ($obj | ConvertTo-Json -Compress) }
+# Local files show their absolute path in the window title while Studio reports
+# only the basename as DataModel.Name. Match that basename after removing
+# Studio's exact title suffix; the ambiguity checks below still apply.
+function Test-StudioTitle([string]$title, [string]$hint) {
+  if (-not $hint -or $title.StartsWith($hint, [StringComparison]::Ordinal)) { return $true }
+  $suffix = ' - Roblox Studio'
+  if (-not $title.EndsWith($suffix, [StringComparison]::Ordinal)) { return $false }
+  $place = $title.Substring(0, $title.Length - $suffix.Length)
+  if ($place -cnotmatch '^(?:[A-Za-z]:[\\/]|\\\\|/)') { return $false }
+  return $place.Substring($place.LastIndexOfAny([char[]]@([char]'\', [char]'/')) + 1) -ceq $hint
+}
+$hint = $env:MCP_CAPTURE_TITLE_HINT
+$outFile = $env:MCP_CAPTURE_OUT
+$candidates = [McpStudioCapture]::Find('RobloxStudioBeta')
+if ($candidates.Count -eq 0) { Emit @{ ok = $false; error = 'no visible Roblox Studio window was found' }; exit 0 }
+$matching = @($candidates | Where-Object { Test-StudioTitle $_.Title $hint })
+$expectedJson = $env:MCP_CAPTURE_EXPECTED_IDENTITY
+if ($expectedJson) {
+  try { $expected = $expectedJson | ConvertFrom-Json -ErrorAction Stop }
+  catch { Emit @{ ok = $false; error = 'invalid expected Studio window identity' }; exit 0 }
+  $matching = @($matching | Where-Object {
+    $_.Handle.ToInt64() -eq $expected.windowId -and $_.Pid -eq $expected.processId -and
+    $expected.bundleIdentifier -ceq 'RobloxStudioBeta'
+  })
+  if ($matching.Count -ne 1) {
+    Emit @{ ok = $false; error = 'the selected Roblox Studio window identity changed between captures' }; exit 0
+  }
+} elseif ($matching.Count -ne 1) {
+  $reason = if ($matching.Count -eq 0) { 'no visible Roblox Studio window matches the requested place title' }
+    else { 'multiple Roblox Studio windows match the requested place title; the capture is ambiguous' }
+  Emit @{ ok = $false; error = $reason }; exit 0
+}
+$pick = $matching[0]
+$identity = @{ windowId = $pick.Handle.ToInt64(); processId = [long]$pick.Pid; bundleIdentifier = 'RobloxStudioBeta' }
+if ([McpStudioCapture]::IsIconic($pick.Handle)) {
+  Emit @{ ok = $false; error = "the Studio window '$($pick.Title)' is minimized; restore it (it may stay behind other windows)" }; exit 0
+}
+$rect = New-Object McpStudioCapture+RECT
+[void][McpStudioCapture]::GetClientRect($pick.Handle, [ref]$rect)
+$w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
+if ($w -le 0 -or $h -le 0) { Emit @{ ok = $false; error = "the Studio window client area is empty ($w x $h)" }; exit 0 }
+$bmp = New-Object System.Drawing.Bitmap $w, $h, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$hdc = $g.GetHdc()
+# PW_CLIENTONLY (1) | PW_RENDERFULLCONTENT (2): DWM-composited client area, occluded windows included.
+$printed = [McpStudioCapture]::PrintWindow($pick.Handle, $hdc, 3)
+$g.ReleaseHdc($hdc); $g.Dispose()
+if (-not $printed) { $bmp.Dispose(); Emit @{ ok = $false; error = 'PrintWindow failed for the Studio window' }; exit 0 }
+$bounds = New-Object System.Drawing.Rectangle 0, 0, $w, $h
+$data = $bmp.LockBits($bounds, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$bytes = New-Object byte[] ($data.Stride * $h)
+[System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+$stride = $data.Stride
+$bmp.UnlockBits($data); $bmp.Dispose()
+[System.IO.File]::WriteAllBytes($outFile, $bytes)
+Emit @{ ok = $true; width = $w; height = $h; stride = $stride; title = $pick.Title; identity = $identity }
+`;
+
+type WindowsCaptureReport =
+  | { ok: false; error: string }
+  | { ok: true; width: number; height: number; stride: number; title: string; identity: HostWindowIdentity };
+
+function validWindowsIdentity(value: unknown): value is HostWindowIdentity {
+  return value !== null && typeof value === 'object' &&
+    'windowId' in value && typeof value.windowId === 'number' && Number.isSafeInteger(value.windowId) && value.windowId > 0 &&
+    'processId' in value && typeof value.processId === 'number' && Number.isSafeInteger(value.processId) &&
+    value.processId > 0 && value.processId <= 0xffffffff &&
+    'bundleIdentifier' in value && value.bundleIdentifier === 'RobloxStudioBeta';
+}
+
+function parseWindowsCaptureReport(value: unknown, expectedIdentity?: HostWindowIdentity): WindowsCaptureReport {
+  if (value === null || typeof value !== 'object' || !('ok' in value)) throw new Error('invalid Windows capture report');
+  if (value.ok === false && 'error' in value && typeof value.error === 'string') return { ok: false, error: value.error };
+  if (!('identity' in value) || !validWindowsIdentity(value.identity)) throw new Error('invalid Windows capture window identity');
+  const identity = value.identity;
+  if (expectedIdentity && (identity.windowId !== expectedIdentity.windowId || identity.processId !== expectedIdentity.processId ||
+      identity.bundleIdentifier !== expectedIdentity.bundleIdentifier)) {
+    throw new Error('the selected Roblox Studio window identity changed between captures');
+  }
+  if (value.ok !== true ||
+      !('width' in value) || typeof value.width !== 'number' || !Number.isSafeInteger(value.width) || value.width <= 0 ||
+      !('height' in value) || typeof value.height !== 'number' || !Number.isSafeInteger(value.height) || value.height <= 0 ||
+      !('stride' in value) || typeof value.stride !== 'number' || !Number.isSafeInteger(value.stride) || value.stride < value.width * 4 ||
+      value.width > 16384 || value.height > 16384 || value.stride * value.height > 128 * 1024 * 1024 ||
+      !('title' in value) || typeof value.title !== 'string') {
+    throw new Error('invalid Windows capture dimensions or title');
+  }
+  return { ok: true, width: value.width, height: value.height, stride: value.stride, title: value.title, identity };
+}
+
+function powershellPath(): string {
+  if (isWslWindowsHost()) return WSL_WINDOWS_POWERSHELL;
+  const systemRoot = process.env.SystemRoot ?? process.env.windir;
+  if (systemRoot) {
+    const candidate = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return 'powershell.exe';
+}
+
+export function windowsCaptureEnvironment(
+  titleHint: string | undefined,
+  outFile: string,
+  expectedIdentity: HostWindowIdentity | undefined,
+  wsl: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const captureEnv = {
+    ...env, MCP_CAPTURE_TITLE_HINT: titleHint ?? '', MCP_CAPTURE_OUT: outFile,
+    MCP_CAPTURE_EXPECTED_IDENTITY: expectedIdentity ? JSON.stringify(expectedIdentity) : '',
+  };
+  // From WSL the helper writes the frame to the Linux temp file through its
+  // \\wsl.localhost path, which WSLENV's /p translation supplies.
+  return wsl
+    ? withWslEnv(captureEnv, ['MCP_CAPTURE_TITLE_HINT/w', 'MCP_CAPTURE_OUT/pw', 'MCP_CAPTURE_EXPECTED_IDENTITY/w'])
+    : captureEnv;
+}
+
+function runWindowsCapture(titleHint: string | undefined, outFile: string, expectedIdentity?: HostWindowIdentity): Promise<unknown> {
+  const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+  const encoded = Buffer.from(WINDOWS_CAPTURE_SCRIPT, 'utf16le').toString('base64');
+  const wsl = isWslWindowsHost();
+  const child = spawn(
+    powershellPath(),
+    ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+    {
+      env: windowsCaptureEnvironment(titleHint, outFile, expectedIdentity, wsl),
+      // A Windows program started from WSL cannot use a Linux working directory.
+      ...(wsl ? { cwd: '/mnt/c/Windows' } : {}),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    },
+  );
+  let stdout = '';
+  let stderr = '';
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    child.kill();
+    reject(new Error(`host window capture timed out after ${HOST_CAPTURE_TIMEOUT_MS}ms`));
+  }, HOST_CAPTURE_TIMEOUT_MS);
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+  child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+  child.on('error', (error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    reject(new Error(`could not start PowerShell for host window capture: ${error.message}`));
+  });
+  child.on('close', (code) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+    const last = lines[lines.length - 1];
+    if (last && last.startsWith('{')) {
+      try {
+        resolve(JSON.parse(last));
+        return;
+      } catch {
+        // fall through to the generic failure below
+      }
+    }
+    const detail = (stderr.trim() || stdout.trim()).slice(0, 600);
+    reject(new Error(`host window capture helper exited with code ${code}${detail ? `: ${detail}` : ''}`));
+  });
+  return promise;
+}
+
+// Captures the Studio window (the client area on Windows) as RGBA. `titleHint` is the place
+// name shown in the window title (used to pick among several open places).
+export async function captureStudioWindow(
+  titleHint?: string,
+  expectedIdentity?: HostWindowIdentity,
+  options?: HostCaptureOptions,
+): Promise<HostCaptureResult> {
+  if (isHostCaptureDisabled()) {
+    return { ok: false, error: 'host window capture is disabled by ROBLOX_STUDIO_HOST_CAPTURE' };
+  }
+  if (!isHostCaptureSupported()) {
+    return { ok: false, error: hostCaptureUnsupportedReason() };
+  }
+  if (process.platform === 'darwin') return captureMacStudioWindow(titleHint, expectedIdentity);
+  if (isNativeLinuxHost()) return captureLinuxStudioWindow(titleHint, expectedIdentity, options);
+  const outFile = path.join(os.tmpdir(), `robloxstudio-mcp-capture-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.bgra`);
+  try {
+    const report = parseWindowsCaptureReport(await runWindowsCapture(titleHint, outFile, expectedIdentity), expectedIdentity);
+    if (!report.ok) return report;
+    const raw = fs.readFileSync(outFile);
+    if (raw.length !== report.stride * report.height) throw new Error('Windows capture returned an invalid BGRA byte count');
+    const { width, height, stride } = report;
+    const rgba = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      const src = y * stride;
+      const dst = y * width * 4;
+      for (let x = 0; x < width; x++) {
+        const s = src + x * 4;
+        const d = dst + x * 4;
+        rgba[d] = raw[s + 2];
+        rgba[d + 1] = raw[s + 1];
+        rgba[d + 2] = raw[s];
+        rgba[d + 3] = 255;
+      }
+    }
+    return { ok: true, capture: { width, height, rgba, title: report.title, identity: report.identity } };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    fs.rmSync(outFile, { force: true });
+  }
+}

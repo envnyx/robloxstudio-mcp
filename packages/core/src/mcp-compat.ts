@@ -1,0 +1,207 @@
+import {
+  McpServer,
+  ProtocolError,
+  ProtocolErrorCode,
+  ResourceTemplate,
+} from '@modelcontextprotocol/server';
+import { DOC_CATEGORIES, fetchRobloxDoc, isDocCategory, DocNotFoundError } from './roblox-docs.js';
+
+export const TOOL_GUIDE_URI = 'robloxstudio://tool-guides';
+
+export const TOOL_GUIDE_MARKDOWN = `# Roblox Studio MCP tool guide
+
+Tool descriptions explain selection. Input schemas explain arguments. This guide holds shared workflows and safety notes.
+
+## Connection and paths
+
+- Use canonical DataModel paths returned by the tools. Paths usually start with game.
+- Call get_connected_instances when more than one Studio process may be connected. Pass either a top-level Instance ID or a multiplayer group's role-suffixed Instance ID as instance_id on later calls. A role-suffixed ID selects that server or client as the default target; a conflicting single-peer target is rejected.
+- Use get_place_info for the active place identity and settings.
+
+## Discovery and edit work
+
+- Use get_project_structure for a bounded hierarchy, search_objects for an instance query, and grep_scripts for source text.
+- Use get_instance_properties and get_attributes after locating an instance. get_attributes reports a CFrame value with Position and Components, the 12 CFrame.new arguments including rotation.
+- Use execute_luau for custom traversal, bulk edits, and work that would otherwise need many tool calls. It runs through the Studio plugin context.
+- Use set_properties when several known properties on one instance can be updated in one request. Pass atomic=true when none should change unless all validate; a failed write restores the applied values. Add dryRun=true to preview the conversions.
+
+## Selection and viewport
+
+- Use selection with action=get when the user's Studio selection should define the scope.
+- Use action=set with instance paths to replace, add to, or remove from the selection. An empty paths array in set mode clears it.
+- Use action=view with a BasePart or Model path to frame it, or omit path to frame exactly one selected BasePart or Model. Empty, multiple, or unsupported selections require an explicit target or a changed selection. The original camera type is restored after framing, including on failure. The current viewing direction is preserved unless from or angleY overrides it. padding below 1 crops closer and above 1 pulls back.
+- For visual proof, change the instance, frame it with selection, then call capture_screenshot.
+
+## Video recording
+
+- Use capture_video instead of repeated capture_screenshot calls to review motion such as a cutscene, camera path, tween, or animation. action=record records for duration_ms (up to 30 s) and blocks. To record a moment you trigger with other tools, call action=start, trigger it (execute_luau, eval_client_runtime, or simulated input), then action=stop; a started recording stops itself after 5 minutes.
+- The result saves an MP4 at video.path and returns one storyboard image of evenly spaced frames, with each frame's time in storyboard.times_ms; frames sets how many (0 omits the image). Re-sample part of a saved video with action=storyboard, input_path, start_ms, and end_ms instead of recording again.
+- During a playtest the recording follows the client viewport, like capture_screenshot. It reads the Studio window on the MCP host through FFmpeg: 8 or newer on Windows or WSL, which keeps recording behind other windows but not while Studio is minimized; 5.1 or newer with x11grab on Linux, which records the screen area, so Studio must stay uncovered and on-screen. Studio draws about 15 fps in the background, so bring Studio to the front for smooth playback.
+
+## Script changes
+
+- Read the relevant source with get_script_source before changing it.
+- Use edit_script_lines, insert_script_lines, or delete_script_lines for focused changes with known line numbers. Pass the revision from get_script_source as expected_revision to insert_script_lines or delete_script_lines: line numbers name different text once the script changes, and a retried call is refused instead of applied twice.
+- Put several related replacements in one script into one edit_script_lines call with edits. They match the source as read, apply as one undo step, and none apply if any fails. Pass the revision from get_script_source as expected_revision so a script changed since the read is rejected, and use dry_run to preview the diff.
+- Use set_script_source only when replacing the whole script, with expected_revision when an editor draft may have changed it.
+- Use find_and_replace_in_scripts with dryRun first when a replacement may affect several scripts. The preview lists each script with its replacement count, diff, and revision. Apply with its revisions as expected_revisions to change exactly the reviewed scripts: any script edited, added, or no longer matching since the preview refuses the whole apply, and maxReplacements is checked against the total before the first write. If a write fails partway, the scripts already written are restored unless they changed again; those keep their newer text and the result returns their original source.
+
+## Playtests and runtime Luau
+
+Start solo_playtest or multiplayer_playtest before targeting a live server or client. Stop the playtest when the scenario is complete.
+
+To wait for game state, pass wait_until to eval_server_runtime or eval_client_runtime instead of sleeping or repeating calls. wait_until is a Luau expression such as workspace:GetAttribute("Round") == 2, or a block that returns a value (used when the text compiles only as a block). It must not yield: WaitForChild, task.wait, or a remote call ends the wait with an error, so use FindFirstChild. It is polled every poll_ms (default 250; at most 120 polls per wait, so long waits poll less often) until truthy or until timeout_s (default 20, max 300) passes. Runtime errors count as not yet true, so a condition may index objects that do not exist yet; on timeout the result carries the last value and lastError. A compile error, a yield, a stopped playtest, or a vanished peer ends the wait at once. code, when given, runs once before polling. The result is {satisfied, value, elapsed_ms, polls}, plus error when satisfied is false; value is the condition's result as text.
+
+solo_playtest start defaults to mode=play (server and client-1); mode=run starts a server only. A start (solo or multiplayer) succeeds only after every runtime peer answers a trivial eval, so the next eval, log, or capture call can run at once. Its targets list has one {role, instance_id, target} per peer: pass that instance_id, plus target on tools that take one, to address the peer. Raise ready_timeout_s (default 90) for slow places. A failed start lists notReady peers with their last error and leaves the playtest running; stop it before starting again.
+
+execute_luau runs through the Studio plugin. eval_server_runtime and eval_client_runtime run inside a live game VM and share that VM's require cache with game scripts. Use the eval tools when module state or the runtime Script or LocalScript environment matters.
+
+Requests to a client Peer go through the server Peer's broker. client_broker_timeout and client_bridge_unresponsive describe that channel, not the game: the client can keep running while its bridge is stalled. Their message says whether the request reached the client, is still running there, or is held up between server and client. Do not treat them as a client hang. Check the game through eval_server_runtime, and restart the playtest if the bridge does not recover.
+
+Read output with get_runtime_logs. Reuse nextCursor as cursor for one Instance, or nextCursorByInstance as cursor_by_instance for a Multiplayer Group, instead of requesting the full process streams again.
+
+- Each Peer VM retains approximately 64 KiB of message text, rather than a fixed message count. Reads do not consume or clear the buffer; incoming messages evict old entries.
+- totalDropped sums lifetime eviction counts from successfully read Peers. It counts messages evicted, not messages missed by this caller, and may decrease when Peers fail, disconnect, or reload.
+- For successfully read Peers, nextCursor advances past all captured entries, including those omitted by filter or tail. It is a continuation watermark, not pagination through omitted results; continuing from it will not return those entries.
+
+## Long calls and pending results
+
+MCP clients abandon a call after their own timeout, and the caller then cannot tell what happened. solo_playtest start and stop, multiplayer_playtest start, add_players, leave_client and end, and wait_until therefore answer within a 25 second response budget (ROBLOX_STUDIO_MCP_RESPONSE_BUDGET_MS). Work still running then returns state "pending" with a requestId and keeps running. Call get_request_status with that request_id and wait_ms up to 25000 until state is "settled"; its result field holds the original result, or outcome is "error" when the call failed. Do not repeat the call: an identical call while it runs joins the same job instead of starting the playtest twice. Finished results stay available for five minutes in the same server process.
+
+## Screenshots
+
+capture_screenshot returns the 3D viewport for the edit view or, during a playtest, the client view.
+
+- frames=N with interval_ms (default 500) captures a timed sequence: at most 16 frames within 20 seconds. grid=true returns them as one numbered contact sheet; without grid each frame is a separate image. The text item lists each frame's atMs offset.
+- To review motion, use capture_video where it can record (FFmpeg on the MCP host); it captures real motion. A contact sheet is a cheap short sample that works everywhere.
+- Take simulate_mouse_input coordinates from a single-frame capture, never from a contact sheet.
+
+## Simulation and input
+
+- Inspect current settings with get_simulation_state before changing them.
+- Apply network conditions with set_network_profile. Roblox caps packet loss at 0.5 percent.
+- Inspect built-in device IDs with get_device_simulator_state, then apply one with set_device_simulator or compare several with capture_device_matrix.
+- Clear temporary network and device settings with reset_simulation_state after a scenario.
+- Capture the viewport with capture_screenshot before simulate_mouse_input so the pixel coordinates match. Keyboard input should target a live client when game input is under test.
+- Mouse movement needs a client with a mouse; stop touch device emulation with set_device_simulator stopSimulation=true first.
+- To chain inputs in one call or target a GUI element by path, run execute_luau on that client and call UserInputService:CreateVirtualInput() (SendMouseButton, SendMousePosition, SendPointerAction, SendKey, SendTextInput). Convert a GuiObject's AbsolutePosition to viewport pixels by adding GuiService:GetGuiInset() unless its ScreenGui ignores the inset. Wrap the steps in pcall and release held keys and buttons in the same script; its VirtualInput is separate from the one simulate_mouse_input and simulate_keyboard_input use.
+- Do not lock the cursor (MouseBehavior.LockCenter, first-person camera) or call SendMouseDelta: Studio pins and hides the user's real OS cursor while it is locked.
+
+## Debugging and profiling
+
+- breakpoints requires Studio's Script Editor API beta feature. Logpoints normally use continue_execution=true. A pausing breakpoint with continue_execution=false needs an OnStopped resume handler.
+- breakpoints clear removes only MCP-created breakpoints unless clear_all is true. clear_all also removes user-created breakpoints.
+- capture_script_profiler ranks Luau functions by CPU time. Use output_path when the raw capture is needed.
+- capture_micro_profiler attributes frame time across engine and game work. Its rows are inclusive or cumulative views, so do not sum them as disjoint totals.
+- capture_micro_profiler records every frame of the window (up to 30 s with duration_ms). To profile a moment you trigger with other tools, such as opening a UI, call action=start, trigger it, then action=stop on the same target; a recording stops itself after 120 s.
+- Each result saves the raw capture at capture.path and analyzes it on the MCP host. spike_frames breaks the slowest frames down by thread, top timers, and hot path. Re-analyze a saved capture (over the same recorded frames) or a MicroProfiler .gprx dump with action=analyze and input_path, narrowing with focus, filter, start_frame, and end_frame, without recording again. LibMP (github.com/Roblox/libmp) also opens capture.path for custom analysis.
+- MicroProfiler records frames only while Studio renders. Studio stops rendering when the display turns off or Studio is minimized, and the capture then fails with micro_profiler_no_frames. A Studio window in the background draws about 15 fps while the game can keep running at 60 Hz: frame_summary.presented_fps reports how often Studio drew, and data_quality.render_throttled flags a throttled capture whose absolute costs are not representative.
+- MicroProfiler records a whole Studio process. In solo play edit, server, and client share one process, so any target's capture includes every role's timers (process_roles lists them) and a client is recorded through the server Peer. Use multiplayer_playtest for a separate process per role.
+- With filter, results include no spike_frames unless requested. summary_output_path also receives failures, so a script reading it sees why a capture produced no analysis.
+- data_quality.partial_reasons says when a result covers less than the requested window, for example capture_history_truncated when Studio could not stream the recording and its live history dropped frames.
+- Use baseline_path or baseline for before-and-after MicroProfiler comparisons.
+- Use get_memory_breakdown for memory categories and get_scene_analysis for instance, script, triangle, animation, or audio cost.
+
+## Creator Store and generated assets
+
+Search with search_assets, inspect a shortlist with get_asset_details or get_asset_thumbnail, and preview untrusted content with preview_asset before insert_asset.
+
+Studio must allow third-party asset loading for public third-party previews and insertion. preview_asset scans the complete hierarchy without returning script source. insert_asset removes every LuaSourceContainer and PackageLink before parenting the remaining content, then scans again before insertion.
+
+generate_model stages generated content under ServerStorage for review. upload_asset sends an explicit local file to the chosen Roblox user or group.
+
+generate_model with async=true returns a job status with its requestId before generation finishes. Check it, wait for it, or read its result with get_request_status (wait_ms waits for completion, up to the response budget per check). The job stays on the Studio instance that started it. A disconnected caller or an ended wait never cancels it, and no tool can cancel a running generation. Pass operation_id so a retry with identical arguments joins the same job instead of generating a second model. With image_path or image_base64, the status adds phase (uploading, generating, completed, failed, or unknown when a wait ended without a result) and preparation; a retry reuses the uploaded image, and an upload whose outcome is unknown is never repeated. Results stay available for five minutes after the job finishes (or after timeout_ms passes without a result), within the current server session; large results can be evicted sooner.
+
+## Monetization
+
+manage_monetization lists, reads, creates, and updates developer products and game passes through Roblox Open Cloud. ROBLOX_OPEN_CLOUD_API_KEY needs developer-product:read and developer-product:write, or game-pass:read and game-pass:write, with the experience added to the key. universe_id defaults to the connected Studio place; an unpublished place has no universe.
+
+- Roblox cannot delete developer products or game passes. To retire one, update it with for_sale=false.
+- create keeps new items off sale unless for_sale=true, which also needs a price.
+- create refuses a name that already exists in the universe and returns the existing item. If a create returns create_outcome_unknown, list the universe first; if the item never appears, retry after retry_after.
+- update changes only the arguments supplied, then reads the item back. It refuses to rename an item to a name another item already uses.
+- image_path uploads a local PNG, JPEG, or BMP icon. Roblox shows icons at 512x512 inside a circle, so keep details away from the corners.
+
+## Experience settings
+
+manage_experience reads and changes experience and place settings through Roblox Open Cloud. universe_id defaults to the connected Studio place, and place_id defaults to the root place, whose name and description are the experience title and description.
+
+- update changes only the arguments supplied, then reads the experience back. name, description, and server_size need universe.place:write; voice_chat_enabled, private_server_price, disable_private_servers, devices, social_links, and remove_social_links need universe:write.
+- Roblox refuses place edits while the place is open in an active Team Create session, including one in the connected Studio. update edits the place before the universe, so a refused place edit changes nothing.
+- Setting a private server price cancels existing subscriptions, and disabling private servers shuts down active ones, so these need confirm=true.
+- manage_experience cannot make an experience public or private. Open Cloud ignores visibility changes, and Roblox can refuse to make an experience public through an API key. get still reports visibility; change it in Creator Hub or Studio's Game Settings.
+- Genre, avatar, playtester, and other settings that Open Cloud does not expose, and the age rating, cannot be changed.
+
+## RBXM files
+
+- export_rbxm writes selected instances to an explicit local path. It can read the edit DataModel or a live server DataModel.
+- import_rbxm accepts exactly one local path, HTTP or HTTPS URL, or base64 source. It parents imported instances under the supplied canonical path.
+
+## Studio processes
+
+manage_instance can launch, inspect, and close Studio or list published place revisions. A process-identity launch returns a suspended launch that must be authorized and completed explicitly. Keep its launch_id until the connection has an instance_id.
+
+## Roblox reference material
+
+Use get_roblox_docs for official engine and Luau reference pages. Use get_roblox_skills to list or read Roblox-authored Studio Assistant skills when their longer guidance is useful.
+`;
+
+/** Official Roblox reference templates shared by the HTTP and stdio servers. */
+export function registerResourceHandlers(server: McpServer): void {
+  server.registerResource(
+    'Roblox Studio MCP tool guide',
+    TOOL_GUIDE_URI,
+    {
+      description: 'Detailed workflows and safety notes for Roblox Studio MCP tools.',
+      mimeType: 'text/markdown',
+    },
+    async (resourceUrl) => ({
+      contents: [{
+        uri: resourceUrl.href,
+        mimeType: 'text/markdown',
+        text: TOOL_GUIDE_MARKDOWN,
+      }],
+    }),
+  );
+
+  const templates = [
+    ['classes', 'className', 'Roblox class documentation', 'Official Roblox engine class reference.'],
+    ['enums', 'enumName', 'Roblox enum documentation', 'Official Roblox engine enum reference.'],
+    ['datatypes', 'dataTypeName', 'Roblox datatype documentation', 'Official Roblox engine datatype reference.'],
+    ['libraries', 'libraryName', 'Roblox library documentation', 'Official Roblox Luau library reference.'],
+    ['globals', 'globalsPage', 'Roblox globals documentation', 'Official Roblox globals reference.'],
+  ] as const;
+
+  for (const [category, variable, name, description] of templates) {
+    server.registerResource(
+      name,
+      new ResourceTemplate(`robloxdocs://${category}/{${variable}}`, { list: undefined }),
+      { description, mimeType: 'text/markdown' },
+      async (resourceUrl) => {
+        const uri = resourceUrl.href;
+        const match = uri.match(/^robloxdocs:\/\/([^/]+)\/([^/]+)$/);
+        if (!match || !isDocCategory(match[1])) {
+          throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Resource ${uri} not found`);
+        }
+
+        const [, docCategory, rawName] = match;
+        const docName = decodeURIComponent(rawName);
+        try {
+          const content = await fetchRobloxDoc(docCategory, docName);
+          return {
+            contents: [{ uri, mimeType: 'text/markdown', text: content }],
+          };
+        } catch (error) {
+          if (error instanceof DocNotFoundError) {
+            throw new ProtocolError(
+              ProtocolErrorCode.InvalidParams,
+              `Resource ${uri} not found. Names are case-sensitive PascalCase; valid categories: ${DOC_CATEGORIES.join(', ')}.`,
+            );
+          }
+          console.error(`[resource:${uri}]`, error);
+          throw new ProtocolError(ProtocolErrorCode.InternalError, `Failed to read ${uri}.`);
+        }
+      },
+    );
+  }
+}
