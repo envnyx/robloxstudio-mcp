@@ -16,7 +16,7 @@ Complete your AI assistant integration with this easy-to-install Studio plugin. 
 Run the installer bundled with the latest server package:
 
 ```bash
-npx -y @chrrxs/robloxstudio-mcp@latest --install-plugin
+npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp --install-plugin
 ```
 
 Fully close and reopen Roblox Studio after the plugin is installed or updated.
@@ -49,12 +49,12 @@ Choose your AI assistant:
 
 **For Claude Code:**
 ```bash
-claude mcp add robloxstudio -- npx -y @chrrxs/robloxstudio-mcp@latest --auto-install-plugin
+claude mcp add robloxstudio -- npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp --auto-install-plugin
 ```
 
 **For Codex CLI:**
 ```bash
-codex mcp add robloxstudio -- npx -y @chrrxs/robloxstudio-mcp@latest --auto-install-plugin
+codex mcp add robloxstudio -- npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp --auto-install-plugin
 ```
 
 **For Claude Desktop/Others:**
@@ -63,13 +63,13 @@ codex mcp add robloxstudio -- npx -y @chrrxs/robloxstudio-mcp@latest --auto-inst
   "mcpServers": {
     "robloxstudio-mcp": {
       "command": "npx",
-      "args": ["-y", "@chrrxs/robloxstudio-mcp@latest", "--auto-install-plugin"]
+      "args": ["-y", "--allow-git=all", "-p", "github:As-tra/robloxstudio-mcp-cloudfare-code-mode", "robloxstudio-mcp", "--auto-install-plugin"]
     }
   }
 }
 ```
 
-`@latest` floats the server package to the newest npm release. `--auto-install-plugin` copies the matching `.rbxmx` bundled with that package into Studio's Plugins folder when the server starts.
+The server is built from the GitHub repo's default branch (`git` must be signed in to GitHub, since the repo is private). `--auto-install-plugin` copies the matching `.rbxmx` built with it into Studio's Plugins folder when the server starts.
 
 The plugin and server must have matching versions. If Studio cannot connect after an update, restart the MCP server with `--auto-install-plugin`, then fully close and reopen Studio so it loads the matching bundled plugin file.
 
@@ -82,7 +82,7 @@ If you encounter issues, you may need to run it through `cmd`. Update your confi
   "mcpServers": {
     "robloxstudio-mcp": {
       "command": "cmd",
-      "args": ["/c", "npx", "-y", "@chrrxs/robloxstudio-mcp@latest", "--auto-install-plugin"]
+      "args": ["/c", "npx", "-y", "--allow-git=all", "-p", "github:As-tra/robloxstudio-mcp-cloudfare-code-mode", "robloxstudio-mcp", "--auto-install-plugin"]
     }
   }
 }

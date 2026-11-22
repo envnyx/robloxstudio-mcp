@@ -845,12 +845,18 @@ describe('distribution metadata security contract', () => {
 
     expect(combinedSources).not.toContain('Akramle');
     expect(combinedSources).not.toContain('github:Akramle');
-    expect(combinedSources).toContain('@chrrxs/robloxstudio-mcp@latest');
+    expect(combinedSources).toContain('-p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp');
+    expect(combinedSources).not.toContain('@chrrxs/robloxstudio-mcp@latest');
     expect(combinedSources).toContain('github.com/chrrxs/robloxstudio-mcp');
   });
 
   test('ordinary package lifecycle hooks cannot install or remove Studio plugins', () => {
-    expect(rootPackage.scripts?.prepare).toBeUndefined();
+    // prepare builds the repo for `npx -p github:...` installs; it may only build plugin artifacts.
+    const prepare = rootPackage.scripts?.prepare ?? '';
+    for (const step of prepare.split('&&').filter((part) => part.includes('build-plugin.mjs'))) {
+      expect(step).toContain('--build-only');
+    }
+    expect(prepare).not.toMatch(/build:plugins?\b|install-plugin/);
     expect(rootPackage.scripts?.prepack).toBeUndefined();
     expect(rootPackage.scripts?.postinstall).toBeUndefined();
   });
