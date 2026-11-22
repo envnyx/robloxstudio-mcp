@@ -29,7 +29,7 @@ import { exportReleaseArtifact } from './auto-install-plugin-e2e.mjs';
 import { runRelease } from './run-release.mjs';
 
 const VERSION = '9.8.7';
-const MAIN = '@as-tra/robloxstudio-mcp';
+const MAIN = '@envnyx/robloxstudio-mcp';
 const INSPECTOR = '@chrrxs/robloxstudio-mcp-inspector';
 const COMMIT = 'a'.repeat(40);
 const NOW = new Date('2026-10-25T12:00:00.000Z');

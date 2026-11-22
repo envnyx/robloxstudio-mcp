@@ -60,9 +60,9 @@ See the [complete tool list](packages/core/src/tools/definitions.ts).
 
 Choose your MCP client below. Each setup installs the matching Studio plugin automatically.
 
-The server is published on npm as `@as-tra/robloxstudio-mcp`. The inspector
+The server is published on npm as `@envnyx/robloxstudio-mcp`. The inspector
 edition is not on npm yet, so its commands build it from the
-[GitHub repo](https://github.com/As-tra/robloxstudio-mcp-cloudfare-code-mode): the
+[GitHub repo](https://github.com/envnyx/robloxstudio-mcp): the
 first run takes a few minutes, `git` must be signed in to GitHub (the repo is
 private), and `--allow-git=all` is needed because npm 12 refuses git installs by default.
 
@@ -70,7 +70,7 @@ private), and `--allow-git=all` is needed because npm 12 refuses git installs by
 <summary>Codex CLI</summary>
 
 ```bash
-codex mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-install-plugin
+codex mcp add robloxstudio -- npx -y @envnyx/robloxstudio-mcp@latest --auto-install-plugin
 ```
 
 </details>
@@ -79,7 +79,7 @@ codex mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-inst
 <summary>Claude Code</summary>
 
 ```bash
-claude mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-install-plugin
+claude mcp add robloxstudio -- npx -y @envnyx/robloxstudio-mcp@latest --auto-install-plugin
 ```
 
 </details>
@@ -88,7 +88,7 @@ claude mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-ins
 <summary>Antigravity CLI</summary>
 
 ```bash
-agy mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-install-plugin
+agy mcp add robloxstudio -- npx -y @envnyx/robloxstudio-mcp@latest --auto-install-plugin
 ```
 
 </details>
@@ -101,7 +101,7 @@ agy mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-instal
   "mcpServers": {
     "robloxstudio-mcp": {
       "command": "npx",
-      "args": ["-y", "@as-tra/robloxstudio-mcp@latest", "--auto-install-plugin"]
+      "args": ["-y", "@envnyx/robloxstudio-mcp@latest", "--auto-install-plugin"]
     }
   }
 }
@@ -122,7 +122,7 @@ When the plugin displays **Connected**, you're ready.
 **Manual plugin installation.**
 
 ```bash
-npx -y @as-tra/robloxstudio-mcp@latest --install-plugin
+npx -y @envnyx/robloxstudio-mcp@latest --install-plugin
 ```
 
 Both editions prefer the bundled plugin. If it is missing, installation downloads
@@ -156,7 +156,7 @@ Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode/) and its
   returns only what the model needs. Inputs are checked against each tool's schema.
 
 ```bash
-claude mcp add robloxstudio -- npx -y @as-tra/robloxstudio-mcp@latest --auto-install-plugin --code-mode
+claude mcp add robloxstudio -- npx -y @envnyx/robloxstudio-mcp@latest --auto-install-plugin --code-mode
 ```
 
 With the 51 standard tools, the `tools/list` payload drops from 53,463 to 1,002
@@ -183,19 +183,19 @@ Install only one variant at a time (the installers remove the other automaticall
 **Codex CLI**
 
 ```bash
-codex mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp-inspector --auto-install-plugin
+codex mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:envnyx/robloxstudio-mcp robloxstudio-mcp-inspector --auto-install-plugin
 ```
 
 **Claude Code**
 
 ```bash
-claude mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp-inspector --auto-install-plugin
+claude mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:envnyx/robloxstudio-mcp robloxstudio-mcp-inspector --auto-install-plugin
 ```
 
 **Antigravity CLI**
 
 ```bash
-agy mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:As-tra/robloxstudio-mcp-cloudfare-code-mode robloxstudio-mcp-inspector --auto-install-plugin
+agy mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:envnyx/robloxstudio-mcp robloxstudio-mcp-inspector --auto-install-plugin
 ```
 
 **Other clients (Cursor, Claude Desktop, etc.)**
@@ -205,7 +205,7 @@ agy mcp add robloxstudio-inspector -- npx -y --allow-git=all -p github:As-tra/ro
   "mcpServers": {
     "robloxstudio-inspector": {
       "command": "npx",
-      "args": ["-y", "--allow-git=all", "-p", "github:As-tra/robloxstudio-mcp-cloudfare-code-mode", "robloxstudio-mcp-inspector", "--auto-install-plugin"]
+      "args": ["-y", "--allow-git=all", "-p", "github:envnyx/robloxstudio-mcp", "robloxstudio-mcp-inspector", "--auto-install-plugin"]
     }
   }
 }

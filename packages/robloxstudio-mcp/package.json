@@ -1,5 +1,5 @@
 {
-  "name": "@as-tra/robloxstudio-mcp",
+  "name": "@envnyx/robloxstudio-mcp",
   "version": "3.5.0",
   "description": "MCP server for testing, debugging, and controlling Roblox Studio from AI coding tools",
   "main": "dist/index.js",
@@ -31,11 +31,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/As-tra/robloxstudio-mcp-cloudfare-code-mode.git"
+    "url": "git+https://github.com/envnyx/robloxstudio-mcp.git"
   },
-  "homepage": "https://github.com/As-tra/robloxstudio-mcp-cloudfare-code-mode#readme",
+  "homepage": "https://github.com/envnyx/robloxstudio-mcp#readme",
   "bugs": {
-    "url": "https://github.com/As-tra/robloxstudio-mcp-cloudfare-code-mode/issues"
+    "url": "https://github.com/envnyx/robloxstudio-mcp/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",

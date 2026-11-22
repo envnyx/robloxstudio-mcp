@@ -19,7 +19,7 @@ import { SaxesParser } from 'saxes';
 import { getStudioPlatformCapabilities } from './studio-platform.js';
 
 // Shared helpers for the per-package install-plugin.ts in
-// @as-tra/robloxstudio-mcp and @chrrxs/robloxstudio-mcp-inspector. Bundled
+// @envnyx/robloxstudio-mcp and @chrrxs/robloxstudio-mcp-inspector. Bundled
 // into both via tsup's noExternal at publish time, so changes here ship in
 // both packages on the next publish.
 const DEFAULT_PLUGIN_PORT = 58741;

@@ -15,7 +15,7 @@ import {
 import { join } from 'path';
 
 const PLUGIN_ASSET_BY_PACKAGE = {
-  '@as-tra/robloxstudio-mcp': 'MCPPlugin.rbxmx',
+  '@envnyx/robloxstudio-mcp': 'MCPPlugin.rbxmx',
   '@chrrxs/robloxstudio-mcp-inspector': 'MCPInspectorPlugin.rbxmx',
 };
 

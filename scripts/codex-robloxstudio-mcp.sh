@@ -88,7 +88,7 @@ fi
 export PATH
 
 if [[ "${ROBLOXSTUDIO_MCP_USE_PUBLISHED:-}" == "1" ]]; then
-	exec npx -y @as-tra/robloxstudio-mcp@latest --auto-install-plugin
+	exec npx -y @envnyx/robloxstudio-mcp@latest --auto-install-plugin
 fi
 
 cd "${DEV_ROOT}"

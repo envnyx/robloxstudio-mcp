@@ -20,7 +20,7 @@ const prepackScript = path.join(repoRoot, 'scripts', 'prepack.mjs');
 const packages = [
   {
     directory: 'robloxstudio-mcp',
-    name: '@as-tra/robloxstudio-mcp',
+    name: '@envnyx/robloxstudio-mcp',
     asset: 'MCPPlugin.rbxmx',
   },
   {
