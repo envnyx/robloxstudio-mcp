@@ -133,7 +133,7 @@ async function gate({ failAt, exportTarballs = true, stale = false } = {}) {
   assert.deepEqual(written.stages.map((stage) => stage.name),
     ['auto-install + functional', 'WSL process identity', 'lifecycle regressions', 'parallel Studio isolation']);
   assert.equal(written.source, undefined, 'only the outer harness may bind the source commit');
-  const files = [tarballFile(MAIN, VERSION), tarballFile(INSPECTOR, VERSION)];
+  const files = [tarballFile(MAIN, VERSION), tarballFile(INSPECTOR, VERSION)].sort();
   assert.deepEqual(written.artifacts.map((artifact) => artifact.file), files, 'stale tarballs from an earlier run are removed');
   for (const artifact of written.artifacts) {
     const bytes = readFileSync(path.join(outputDirectory, 'artifacts', artifact.file));
@@ -384,14 +384,14 @@ const refusals = [
   ['no stages', { recordMutator: (record) => { record.stages = []; } }, {}, 'stages', /no stages/],
   ['hash mismatch', { tarballMutator: (name, bytes) => (name === MAIN ? tarball({ name, version: VERSION, extra: 'rebuilt' }) : bytes) }, {}, 'artifacts', /does not match the tested tarball/],
   ['missing tarball', { recordMutator: (record) => { record.artifacts[1].file = 'absent-9.8.7.tgz'; } }, {}, 'artifacts', /absent-9.8.7.tgz is missing/],
-  ['missing package', { recordMutator: (record) => { record.artifacts.pop(); } }, {}, 'artifacts', /0 tarballs for @chrrxs\/robloxstudio-mcp-inspector/],
+  ['missing package', { recordMutator: (record) => { record.artifacts = record.artifacts.filter((artifact) => artifact.name !== INSPECTOR); } }, {}, 'artifacts', /0 tarballs for @chrrxs\/robloxstudio-mcp-inspector/],
   ['tarball contents', {
     tarballMutator: (name, bytes) => (name === MAIN ? tarball({ name, version: '0.0.1' }) : bytes),
     recordMutator: (record) => {
       const bytes = tarball({ name: MAIN, version: '0.0.1' });
-      Object.assign(record.artifacts[0], { sha256: sha256(bytes), size: bytes.length });
+      Object.assign(record.artifacts.find((artifact) => artifact.name === MAIN), { sha256: sha256(bytes), size: bytes.length });
     },
-  }, {}, 'artifacts', /contains @chrrxs\/robloxstudio-mcp@0.0.1/],
+  }, {}, 'artifacts', new RegExp(`contains ${MAIN}@0\\.0\\.1`)],
   ['version mismatch', { version: '9.8.8' }, {}, 'versions', /package.json versions differ/],
   ['wrong commit', {}, { head: 'c'.repeat(40) }, 'commit', /is for commit a{40}, but HEAD is c{40}/],
   ['dirty tree', {}, { status: '?? notes.txt\n' }, 'tree-clean', /uncommitted or untracked/],
