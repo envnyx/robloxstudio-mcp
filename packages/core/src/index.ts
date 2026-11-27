@@ -1,6 +1,6 @@
 export { RobloxStudioMCPServer } from './server.js';
 export type { ServerConfig } from './server.js';
-export { createHttpServer, listenWithRetry } from './http-server.js';
+export { createHttpServer, listenWithFactory, listenWithRetry } from './http-server.js';
 export type { RobloxStudioHttpApp } from './http-server.js';
 export {
   WebSocketStudioTransport,

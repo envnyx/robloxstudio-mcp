@@ -141,6 +141,12 @@ try {
       `${packageName}: the forwarding session names the older port owner`,
     );
     assert.doesNotMatch(newer.stderr(), /trying next/, `${packageName}: a single-port bind does not claim to try another port`);
+    await delay(350);
+    assert.doesNotMatch(
+      newer.stderr(),
+      /drops mid-call notifications/,
+      `${packageName}: proxy promotion retries do not create throwaway HTTP/MCP handlers while the port is busy`,
+    );
 
     await older.stop();
     await newer.waitForLog(/Promoted from proxy to primary/);

@@ -1,7 +1,7 @@
 import { EventEmitter, once } from 'node:events';
-import { request as nodeRequest } from 'node:http';
+import http, { request as nodeRequest } from 'node:http';
 import request from 'supertest';
-import { TOOL_HANDLERS, createHttpServer, type RobloxStudioHttpApp } from '../http-server.js';
+import { TOOL_HANDLERS, createHttpServer, listenWithFactory, type RobloxStudioHttpApp } from '../http-server.js';
 import { RobloxStudioTools } from '../tools/index.js';
 import { BridgeService } from '../bridge-service.js';
 import { StudioInstanceManager } from '../studio-instance-manager.js';
@@ -955,6 +955,42 @@ describe('HTTP Server', () => {
       });
       expect(response.body.instances[0].peers[0]).not.toHaveProperty('peerId');
       expect(response.body.multiplayerGroups).toEqual([]);
+    });
+  });
+
+  describe('listenWithFactory', () => {
+    test('does not invoke factory when port is occupied', async () => {
+      const blocker = http.createServer();
+      await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+      const address = blocker.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP address');
+      const factory = jest.fn(() => createHttpServer(tools, bridge, undefined, TEST_SERVER_CONFIG));
+      try {
+        await expect(listenWithFactory(factory, '127.0.0.1', address.port, 1)).rejects.toThrow(
+          new RegExp(`Port ${address.port} is in use\\.`),
+        );
+        expect(factory).not.toHaveBeenCalled();
+      } finally {
+        await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
+    });
+
+    test('creates and attaches app once port binds', async () => {
+      const localBridge = new HttpTestBridgeService();
+      const localTools = new RobloxStudioTools(localBridge);
+      const factory = jest.fn(() => createHttpServer(localTools, localBridge, undefined, TEST_SERVER_CONFIG));
+      let server: http.Server | undefined;
+      let localApp: RobloxStudioHttpApp | undefined;
+      try {
+        ({ server, app: localApp } = await listenWithFactory(factory, '127.0.0.1', 0, 1));
+        expect(factory).toHaveBeenCalledTimes(1);
+        const health = await request(server).get('/health').expect(200);
+        expect(health.body).toMatchObject({ serverVersion: READY_BODY.pluginVersion });
+      } finally {
+        await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+        await localApp?.cleanup();
+        await localTools.dispose();
+      }
     });
   });
 });

@@ -1184,3 +1184,70 @@ function bindPort(app: express.Express, host: string, port: number): Promise<htt
   });
   return promise;
 }
+
+/**
+ * Bind a port first and create/attach the Express app only after the socket
+ * succeeds. Avoids wasted setup and repeated startup warnings when a proxy
+ * session polls an occupied port for primary promotion.
+ */
+export async function listenWithFactory<T extends express.Express>(
+  createApp: () => T,
+  host: string,
+  startPort: number,
+  maxAttempts: number = 5,
+): Promise<{ server: http.Server; port: number; app: T }> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const port = startPort + i;
+    try {
+      const { server, app } = await bindPortWithFactory(createApp, host, port);
+      return { server, port, app };
+    } catch (error) {
+      if (
+        error !== null &&
+        typeof error === 'object' &&
+        'code' in error &&
+        error.code === 'EADDRINUSE'
+      ) {
+        if (i + 1 < maxAttempts) console.error(`Port ${port} in use, trying next...`);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error(maxAttempts === 1
+    ? `Port ${startPort} is in use.`
+    : `All ports ${startPort}-${startPort + maxAttempts - 1} are in use. Stop some MCP server instances and retry.`);
+}
+
+function bindPortWithFactory<T extends express.Express>(
+  createApp: () => T,
+  host: string,
+  port: number,
+): Promise<{ server: http.Server; app: T }> {
+  const { promise, resolve, reject } = Promise.withResolvers<{ server: http.Server; app: T }>();
+  const server = http.createServer();
+  const onError = (err: NodeJS.ErrnoException) => {
+    server.removeListener('error', onError);
+    reject(err);
+  };
+  server.once('error', onError);
+  server.listen(port, host, () => {
+    server.removeListener('error', onError);
+    let app: T | undefined;
+    try {
+      app = createApp();
+      server.on('request', app);
+      if ('attachStudioTransport' in app && typeof app.attachStudioTransport === 'function') {
+        app.attachStudioTransport(server);
+      }
+      resolve({ server, app });
+    } catch (error) {
+      server.close();
+      if (app && 'cleanup' in app && typeof app.cleanup === 'function') {
+        void Promise.resolve(app.cleanup()).catch(() => {});
+      }
+      reject(error);
+    }
+  });
+  return promise;
+}

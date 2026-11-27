@@ -1,6 +1,6 @@
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import http from 'http';
-import { createHttpServer, listenWithRetry, TOOL_HANDLERS } from './http-server.js';
+import { createHttpServer, listenWithFactory, TOOL_HANDLERS } from './http-server.js';
 import type { HttpSecurityOptions, RobloxStudioHttpApp } from './http-server.js';
 import { resolveAuthToken } from './auth.js';
 import { RobloxStudioTools } from './tools/index.js';
@@ -82,10 +82,15 @@ export class RobloxStudioMCPServer {
     // basePort. This matches the official Roblox Studio MCP
     // (Roblox/studio-rust-mcp-server, main.rs:43).
     try {
-      primaryApp = createHttpServer(this.tools, this.bridge, this.allowedToolNames, this.config, security);
-      const result = await listenWithRetry(primaryApp, host, basePort, 1);
+      const result = await listenWithFactory(
+        () => createHttpServer(this.tools, this.bridge, this.allowedToolNames, this.config, security),
+        host,
+        basePort,
+        1,
+      );
       httpHandle = result.server;
       boundPort = result.port;
+      primaryApp = result.app;
       console.error(`HTTP server listening on ${host}:${boundPort} for Studio plugin (primary mode)`);
       console.error(`Streamable HTTP MCP endpoint: http://localhost:${boundPort}/mcp`);
       await this.installStudioPlugin();
@@ -127,26 +132,37 @@ export class RobloxStudioMCPServer {
       // with no downstream Studio consumer (queue with no consumer → 30s
       // timeout).
       const promotionIntervalMs = parseInt(process.env.ROBLOX_STUDIO_PROXY_PROMOTION_INTERVAL_MS || '5000');
+      let promoting = false;
       promotionInterval = setInterval(async () => {
+        if (promoting) return;
+        promoting = true;
         let promoted = false;
-        const candidateBridge = new BridgeService();
-        const candidateTools = new RobloxStudioTools(candidateBridge);
-        const candidateApp = createHttpServer(candidateTools, candidateBridge, this.allowedToolNames, this.config, security);
+        let candidateBridge: BridgeService | undefined;
+        let candidateTools: RobloxStudioTools | undefined;
         try {
-          const result = await listenWithRetry(candidateApp, host, basePort, 1);
+          const result = await listenWithFactory(
+            () => {
+              candidateBridge = new BridgeService();
+              candidateTools = new RobloxStudioTools(candidateBridge);
+              return createHttpServer(candidateTools, candidateBridge, this.allowedToolNames, this.config, security);
+            },
+            host,
+            basePort,
+            1,
+          );
           // Bind succeeded — atomically swap to primary mode (synchronous from here).
           // Stop the proxy bridge's background refresh before dropping the reference
           // so its setInterval doesn't keep the object alive past the swap.
           const oldBridge = this.bridge;
           const oldTools = this.tools;
-          this.bridge = candidateBridge;
-          this.tools = candidateTools;
+          this.bridge = candidateBridge!;
+          this.tools = candidateTools!;
           if (oldBridge instanceof ProxyBridgeService) {
             oldBridge.stop();
           }
           httpHandle = result.server;
           boundPort = result.port;
-          primaryApp = candidateApp;
+          primaryApp = result.app;
           bridgeMode = 'primary';
           primaryApp.setMCPServerActive(true);
           console.error(`Promoted from proxy to primary on port ${boundPort}`);
@@ -154,8 +170,12 @@ export class RobloxStudioMCPServer {
           promoted = true;
           await oldTools.dispose();
         } catch {
-          await candidateApp.cleanup().catch(() => {});
-          // basePort still taken — discard the candidate, leave proxy bridge live.
+          if (candidateTools && candidateTools !== this.tools) {
+            await candidateTools.dispose().catch(() => {});
+          }
+          // basePort still taken — no candidate app was created, leave proxy bridge live.
+        } finally {
+          promoting = false;
         }
         if (promoted) await this.installStudioPlugin();
       }, promotionIntervalMs);
