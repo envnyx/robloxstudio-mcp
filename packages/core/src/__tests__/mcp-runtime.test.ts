@@ -521,6 +521,9 @@ describe('MCP v2 tool runtime', () => {
 
       const result = await client.callTool({ name: 'get_place_info', arguments: {} });
       expect(result.structuredContent).toEqual({ placeId: 123 });
+      expect(result.content).toEqual([
+        { type: 'text', text: JSON.stringify({ placeId: 123 }) },
+      ]);
     } finally {
       await client.close();
       await server.close();
@@ -663,7 +666,7 @@ describe('MCP v2 tool runtime', () => {
 
   test.each([
     ['legacy', undefined, true],
-    ['2026-07-28', { mode: { pin: '2026-07-28' as const } }, false],
+    ['2026-07-28', { mode: { pin: '2026-07-28' as const } }, true],
   ])('serves %s clients on the shared HTTP endpoint', async (_label, versionNegotiation, keepsTextProjection) => {
     const definition = TOOL_DEFINITIONS.find((tool) => tool.name === 'get_place_info')!;
     const getPlaceInfo = jest.fn(async () => ({
@@ -696,6 +699,9 @@ describe('MCP v2 tool runtime', () => {
       await client.connect(transport);
       const result = await client.callTool({ name: 'get_place_info', arguments: {} });
       expect(result.structuredContent).toEqual({ placeId: 123 });
+      expect(result.content).toEqual([
+        { type: 'text', text: JSON.stringify({ placeId: 123 }) },
+      ]);
       expect(result.content.some((block) => block.type === 'text')).toBe(keepsTextProjection);
       expect(getPlaceInfo).toHaveBeenCalled();
     } finally {
@@ -733,6 +739,9 @@ describe('MCP v2 tool runtime', () => {
       await client.connect(clientTransport);
       const result = await client.callTool({ name: 'get_place_info', arguments: {} });
       expect(result.structuredContent).toEqual({ placeId: 123 });
+      expect(result.content).toEqual([
+        { type: 'text', text: JSON.stringify({ placeId: 123 }) },
+      ]);
       expect(eras).toContain('modern');
     } finally {
       await client.close().catch(() => {});

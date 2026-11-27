@@ -8,7 +8,7 @@ import {
   type ToolAnnotations,
 } from '@modelcontextprotocol/server';
 import { MultiplayerGroupInUseError, RequestFailure, RoutingFailure, StudioOperationError } from './bridge-service.js';
-import { CODE_MODE_INSTRUCTIONS, codeModeEnabled, runCode, searchTools } from './code-mode.js';
+import { CODE_MODE_INSTRUCTIONS, CODE_MODE_MAX_PARALLEL_CALLS, codeModeEnabled, runCode, searchTools } from './code-mode.js';
 import { registerResourceHandlers } from './mcp-compat.js';
 import { OpenCloudOperationError } from './opencloud-client.js';
 import { StudioLaunchPreDispatchError } from './studio-instance-manager.js';
@@ -195,11 +195,12 @@ export function normalizeToolResult(raw: unknown, era: ProtocolEra): CallToolRes
   };
 }
 
-// Clients such as Claude Code show a failed call's text content and ignore its
-// structuredContent, so an error with no text block reaches the user as
-// "Unknown error". Keep the error JSON as text on MCP failures.
-function withErrorText(result: CallToolResult): CallToolResult {
-  if (!result.isError || !result.structuredContent || result.content.some((block) => block.type === 'text')) {
+// Some MCP clients (e.g., Antigravity CLI, Claude Code on errors) only render
+// content blocks and ignore structuredContent. Per the MCP spec, include the
+// serialized JSON as a text content block alongside structuredContent whenever
+// no text block is already present.
+function withStructuredText(result: CallToolResult): CallToolResult {
+  if (!result.structuredContent || result.content.some((block) => block.type === 'text')) {
     return result;
   }
   return {
@@ -409,9 +410,9 @@ export function createToolServer(options: McpRuntimeOptions): McpServer {
             args as Record<string, unknown>,
             { signal: context.mcpReq.signal },
           );
-          return withErrorText(normalizeToolResult(raw, options.era));
+          return withStructuredText(normalizeToolResult(raw, options.era));
         } catch (error) {
-          return withErrorText(normalizeToolResult({
+          return withStructuredText(normalizeToolResult({
             content: [{ type: 'text', text: JSON.stringify(publicToolErrorBody(definition.name, error)) }],
             isError: true,
           }, options.era));
@@ -439,11 +440,11 @@ function registerCodeModeTools(
   server.registerTool(
     'search',
     {
-      description: 'Find Studio tools by keywords. Returns TypeScript signatures to call inside execute. An empty query lists every tool.',
+      description: 'Find Studio tools. Keywords return the best matching TypeScript signatures; exact tool names separated by spaces return exactly those signatures in one call. An empty query lists every tool.',
       inputSchema: fromJsonSchema<{ query: string; limit?: number }>({
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Keywords, e.g. "edit script" or "playtest logs".' },
+          query: { type: 'string', description: 'Keywords ("edit script") or exact tool names ("get_script_source edit_script_lines").' },
           limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Max signatures; default 8.' },
         },
         required: ['query'],
@@ -456,7 +457,7 @@ function registerCodeModeTools(
   server.registerTool(
     'execute',
     {
-      description: 'Run JavaScript (an async function body, or an async arrow function) with studio.<tool>(input) in scope. Return a value or console.log what you need; failed tool calls throw.',
+      description: 'Run JavaScript (an async function body, or an async arrow function) with studio.<tool>(input) in scope. Batch a whole step into one call: await dependent calls in sequence and run independent ones with Promise.all (up to 16 at once; Promise.allSettled tolerates failures). Return a value or console.log what you need; failed tool calls throw.',
       inputSchema: fromJsonSchema<{ code: string }>({
         type: 'object',
         properties: { code: { type: 'string', description: 'e.g. const r = await studio.get_place_info({}); return r.placeId;' } },
@@ -466,16 +467,31 @@ function registerCodeModeTools(
     },
     async (args, context) => {
       const media: CallToolResult['content'] = [];
+      // Independent calls in one Promise.all run together, capped so a large batch
+      // cannot exceed the plugin's active-request admission limit.
+      let active = 0;
+      const waiting: Array<() => void> = [];
+      const acquire = () => (active < CODE_MODE_MAX_PARALLEL_CALLS
+        ? (active++, Promise.resolve())
+        : new Promise<void>((resolve) => { waiting.push(resolve); }));
+      const release = () => {
+        const next = waiting.shift();
+        if (next) next();
+        else active--;
+      };
       const call = async (name: string, input: Record<string, unknown>) => {
         const checked = await inputSchemas.get(name)!['~standard'].validate(input);
         if (checked.issues) {
           throw new Error(`${name}: invalid input: ${checked.issues.map((issue) => issue.message).join('; ')}`);
         }
+        await acquire();
         let result: CallToolResult;
         try {
           const raw = await options.invoke(options.getTools(), name, checked.value, { signal: context.mcpReq.signal });
           result = normalizeToolResult(raw, 'modern');
+          release();
         } catch (error) {
+          release();
           throw new Error(`${name}: ${JSON.stringify(publicToolErrorBody(name, error))}`);
         }
         media.push(...result.content.filter((block) => block.type !== 'text'));
