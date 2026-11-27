@@ -1,5 +1,5 @@
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
-import { runCode, schemaToTs, searchTools } from '../code-mode.js';
+import { CODE_MODE_MAX_PARALLEL_CALLS, runCode, schemaToTs, searchTools } from '../code-mode.js';
 import { createToolServer, publicToolDefinition } from '../mcp-runtime.js';
 import { TOOL_DEFINITIONS } from '../tools/definitions.js';
 import type { RobloxStudioTools } from '../tools/index.js';
@@ -79,6 +79,49 @@ describe('code mode', () => {
       expect(invalid.isError).toBe(true);
       expect(text(invalid)).toContain('invalid input');
       expect(calls).toEqual(['get_place_info', 'get_script_source']);
+    } finally {
+      await close();
+    }
+  });
+
+  test('search returns several exact tool names in one call, ignoring limit', () => {
+    const catalog = TOOL_DEFINITIONS.map(publicToolDefinition);
+    const found = searchTools(catalog, 'get_script_source edit_script_lines grep_scripts', 1);
+    for (const name of ['get_script_source', 'edit_script_lines', 'grep_scripts']) {
+      expect(found).toContain(`${name}(input:`);
+    }
+    expect(found.match(/\): Promise<any>;/g)).toHaveLength(3);
+  });
+
+  test('runs independent calls in parallel up to the cap', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let total = 0;
+    const { client, close } = await connect(async () => {
+      total++;
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      return { content: [{ type: 'text', text: JSON.stringify({ placeId: 1 }) }] };
+    }, true);
+    try {
+      const result = await client.callTool({ name: 'execute', arguments: { code: 'const r = await Promise.all(Array.from({ length: 40 }, () => studio.get_place_info({}))); return r.length;' } });
+      expect(text(result)).toBe('40');
+      expect(total).toBe(40);
+      expect(maxInFlight).toBe(CODE_MODE_MAX_PARALLEL_CALLS);
+    } finally {
+      await close();
+    }
+  });
+
+  test('Promise.allSettled keeps results when one parallel call fails', async () => {
+    const { client, close } = await connect(async (_tools, name) => (name === 'get_script_source'
+      ? { content: [{ type: 'text', text: JSON.stringify({ error: 'missing' }) }], isError: true }
+      : { content: [{ type: 'text', text: JSON.stringify({ placeId: 1 }) }] }), true);
+    try {
+      const result = await client.callTool({ name: 'execute', arguments: { code: 'const r = await Promise.allSettled([studio.get_place_info({}), studio.get_script_source({ instancePath: "game.X" })]); return r.map(x => x.status);' } });
+      expect(text(result)).toBe('["fulfilled","rejected"]');
     } finally {
       await close();
     }

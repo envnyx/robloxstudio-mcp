@@ -152,8 +152,11 @@ Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode/) and its
 [search/execute server](https://blog.cloudflare.com/code-mode-mcp/):
 
 - `search`: keywords in, TypeScript signatures out (an empty query lists every tool).
+  Several exact tool names separated by spaces return exactly those signatures in one call.
 - `execute`: JavaScript that calls `studio.<tool_name>(input)`, chains calls and
   returns only what the model needs. Inputs are checked against each tool's schema.
+  Independent calls in a `Promise.all` run in parallel (up to 16 at once; the rest
+  wait). Use `Promise.allSettled` to keep the other results when one call fails.
 
 ```bash
 claude mcp add robloxstudio -- npx -y @envnyx/robloxstudio-mcp@latest --auto-install-plugin --code-mode

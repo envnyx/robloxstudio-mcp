@@ -15,7 +15,10 @@ export interface CodeModeTool {
   inputSchema: object;
 }
 
-export const CODE_MODE_INSTRUCTIONS = 'Code mode: Studio tools are not listed individually. Call search with keywords to get TypeScript signatures, then call execute with JavaScript that awaits studio.<tool_name>(input) and returns or console.logs only what you need. Tool names below are those studio methods.';
+/** Most tool calls one `execute` runs at once; the plugin admits at most 128 active requests. */
+export const CODE_MODE_MAX_PARALLEL_CALLS = 16;
+
+export const CODE_MODE_INSTRUCTIONS = 'Code mode: Studio tools are not listed individually. Call search to get TypeScript signatures (several exact tool names separated by spaces return all of them in one call), then call execute with JavaScript that awaits studio.<tool_name>(input) and returns or console.logs only what you need. Batch: do a whole step in one execute. Chain dependent calls with await and run independent ones together with Promise.all (up to 16 run in parallel; Promise.allSettled keeps the other results when one fails). Tool names below are those studio methods.';
 
 export function codeModeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes)$/i.test(env.ROBLOX_MCP_CODE_MODE ?? '');
@@ -72,13 +75,20 @@ export function searchTools(tools: readonly CodeModeTool[], query: string, limit
   if (terms.length === 0) {
     return tools.map((tool) => `${tool.name}: ${tool.description}`).join('\n');
   }
+  // Exact tool names (space, comma or | separated) return exactly those signatures, ignoring `limit`.
+  const words = query.split(/[\s,|]+/).filter(Boolean);
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  if (words.length > 0 && words.every((word) => byName.has(word))) {
+    const exact = [...new Set(words)].map((word) => byName.get(word)!);
+    return `declare const studio: {\n${exact.map(toolDeclaration).join('\n\n')}\n};`;
+  }
   const ranked = tools
     .map((tool) => {
       const name = tool.name.toLowerCase();
       const description = tool.description.toLowerCase();
       const score = terms.reduce((sum, term) =>
         sum + (name.includes(term) ? 3 : 0) + (description.includes(term) ? 1 : 0), 0);
-      return { tool, score };
+      return { tool, score: score + (words.includes(tool.name) ? 100 : 0) };
     })
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score)
